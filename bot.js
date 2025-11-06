@@ -1,3 +1,5 @@
+// index.js — ARI Telegram Bot (Node.js + Telegraf, Railway)
+// ENV: BOT_TOKEN, ADMIN_ID, SITE_URL, PAYMENT_QR_URL
 
 import express from 'express';
 import { Telegraf, Markup } from 'telegraf';
@@ -7,7 +9,7 @@ const BOT_TOKEN      = process.env.BOT_TOKEN;        // токен бота из
 const ADMIN_ID_RAW   = process.env.ADMIN_ID;         // твой Telegram ID
 const ADMIN_ID       = ADMIN_ID_RAW ? Number(ADMIN_ID_RAW) : undefined;
 const SITE_URL       = process.env.SITE_URL || 'https://independent-intuition-production.up.railway.app/';
-const PAYMENT_QR_URL = process.env.PAYMENT_QR_URL || ''; // прямая ссылка на картинку с QR (можно пусто)
+const PAYMENT_QR_URL = process.env.PAYMENT_QR_URL || ''; // ссылка на картинку QR (может быть пусто)
 
 if (!BOT_TOKEN) {
   console.error('❌ Missing BOT_TOKEN env');
@@ -72,7 +74,7 @@ bot.command('id', async (ctx) => {
   await ctx.reply(`Ваш Telegram ID: \`${ctx.from.id}\``, { parse_mode: 'Markdown' });
 });
 
-// ====== Лог на всякий случай (видеть web_app_data в логах) ======
+// Лог: видеть, что web_app_data реально приходит
 bot.on('message', (ctx, next) => {
   if (ctx.message?.web_app_data) {
     console.log('✅ got web_app_data from', ctx.from?.id);
@@ -80,9 +82,7 @@ bot.on('message', (ctx, next) => {
   return next();
 });
 
-// ====== ПРАВИЛЬНЫЙ обработчик WebApp-данных ======
-// Используем универсальный on('message') и проверяем web_app_data,
-// так как on('web_app_data') в Telegraf не срабатывает.
+// ====== Правильный обработчик WebApp-данных ======
 bot.on('message', async (ctx) => {
   if (!ctx.message?.web_app_data) return;
 
@@ -198,9 +198,18 @@ bot.action('slot_other', async (ctx) => {
   }
 });
 
-// ====== Запуск бота (long polling) ======
-bot.launch();
-console.log('✅ ARI bot started');
+// ====== Старт бота: удаляем webhook и запускаем polling ======
+(async () => {
+  try {
+    await bot.telegram.deleteWebhook({ drop_pending_updates: false });
+    console.log('🔧 Webhook deleted (switching to polling)');
+  } catch (e) {
+    console.warn('Webhook delete warning:', e.message);
+  }
+
+  await bot.launch();
+  console.log('✅ ARI bot started');
+})();
 
 // Graceful shutdown
 process.once('SIGINT', () => bot.stop('SIGINT'));
