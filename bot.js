@@ -1,25 +1,68 @@
+// index.js — ARI Telegram Bot (Node.js + Telegraf)
+// Работает на long polling (без вебхуков). Готов к Railway.
+// ВАЖНО: Проверь переменные окружения в Railway: BOT_TOKEN, ADMIN_ID, SITE_URL, PAYMENT_QR_URL
+
 import express from 'express';
 import { Telegraf, Markup } from 'telegraf';
 
 // ====== ENV ======
-const BOT_TOKEN      = process.env.BOT_TOKEN;        // токен @BotFather
-const ADMIN_ID       = Number(process.env.ADMIN_ID); // твой Telegram ID (получишь через /id)
+const BOT_TOKEN      = process.env.BOT_TOKEN;        // токен бота из @BotFather
+const ADMIN_ID_RAW   = process.env.ADMIN_ID;         // твой Telegram ID
+const ADMIN_ID       = ADMIN_ID_RAW ? Number(ADMIN_ID_RAW) : undefined;
 const SITE_URL       = process.env.SITE_URL || 'https://independent-intuition-production.up.railway.app/';
-const PAYMENT_QR_URL = process.env.PAYMENT_QR_URL || ''; // прямая ссылка на картинку твоего QR
+const PAYMENT_QR_URL = process.env.PAYMENT_QR_URL || ''; // прямая ссылка на картинку с QR (можно пусто)
 
 if (!BOT_TOKEN) {
-  console.error('Missing BOT_TOKEN env');
+  console.error('❌ Missing BOT_TOKEN env');
   process.exit(1);
 }
 
 const bot = new Telegraf(BOT_TOKEN);
 
+// ====== Хелперы ======
+function prettyCard(d = {}) {
+  return [
+    '📨 Новая заявка ARI',
+    `ФИО: ${d.fio || '—'}`,
+    `Дата рождения: ${d.dob || '—'}`,
+    `Email: ${d.email || '—'}`,
+    `Жалобы: ${d.complaints || '—'}`,
+    `Анамнез заболевания: ${d.hx_disease || '—'}`,
+    `Анамнез жизни: ${d.hx_life || '—'}`,
+    `Хронические: ${d.chronic || '—'}`,
+    `Лекарства: ${d.meds || '—'}`,
+    `Аллергии: ${d.allergy || '—'}`,
+    `Ранее лечение: ${d.prev_tx || '—'}`
+  ].join('\n');
+}
+
+function makeSlots() {
+  const today = new Date();
+  const slot = (offsetDays, h, m) => {
+    const d = new Date(today);
+    d.setDate(today.getDate() + offsetDays);
+    d.setHours(h, m, 0, 0);
+    const dd = String(d.getDate()).padStart(2, '0');
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mi = String(d.getMinutes()).padStart(2, '0');
+    return { label: `${dd}.${mm} ${hh}:${mi}`, data: `slot_${d.getTime()}` };
+  };
+  return [
+    slot(0, 18, 30),
+    slot(1, 12, 0),
+    slot(1, 19, 0),
+    slot(2, 11, 30),
+    slot(2, 16, 0),
+  ];
+}
+
 // ====== Команды ======
 bot.start(async (ctx) => {
   await ctx.reply(
     'Привет! Это ARI — онлайн-консультации дерматолога.\n\n' +
-    '1) Нажмите кнопку ниже, заполните короткую анкету\n' +
-    '2) Прикрепите фото высыпаний здесь в чате\n' +
+    '1) Нажмите кнопку ниже и заполните короткую анкету\n' +
+    '2) Прикрепите фото высыпаний здесь, в чате\n' +
     '3) Оплатите по QR и подтвердите оплату\n' +
     '4) Я предложу время консультации',
     Markup.inlineKeyboard([
@@ -32,10 +75,22 @@ bot.command('id', async (ctx) => {
   await ctx.reply(`Ваш Telegram ID: \`${ctx.from.id}\``, { parse_mode: 'Markdown' });
 });
 
-// ====== Обработка WebApp данных (после sendData(JSON) со страницы) ======
-bot.on('web_app_data', async (ctx) => {
+// ====== Лог на всякий случай (видеть web_app_data в логах) ======
+bot.on('message', (ctx, next) => {
+  if (ctx.message?.web_app_data) {
+    console.log('✅ got web_app_data from', ctx.from?.id);
+  }
+  return next();
+});
+
+// ====== ПРАВИЛЬНЫЙ обработчик WebApp-данных ======
+// Используем универсальный on('message') и проверяем web_app_data,
+// так как on('web_app_data') в Telegraf не срабатывает.
+bot.on('message', async (ctx) => {
+  if (!ctx.message?.web_app_data) return;
+
   try {
-    const raw = ctx.message.web_app_data?.data;
+    const raw = ctx.message.web_app_data.data;
     const payload = JSON.parse(raw || '{}');
 
     if (payload?.type !== 'ari_request') {
@@ -43,19 +98,6 @@ bot.on('web_app_data', async (ctx) => {
     }
 
     const d = payload.data || {};
-    const pretty = [
-      `📨 Новая заявка ARI`,
-      `ФИО: ${d.fio || '—'}`,
-      `Дата рождения: ${d.dob || '—'}`,
-      `Email: ${d.email || '—'}`,
-      `Жалобы: ${d.complaints || '—'}`,
-      `Анамнез заболевания: ${d.hx_disease || '—'}`,
-      `Анамнез жизни: ${d.hx_life || '—'}`,
-      `Хронические: ${d.chronic || '—'}`,
-      `Лекарства: ${d.meds || '—'}`,
-      `Аллергии: ${d.allergy || '—'}`,
-      `Ранее лечение: ${d.prev_tx || '—'}`
-    ].join('\n');
 
     // Сообщение пациенту
     await ctx.reply(
@@ -63,12 +105,15 @@ bot.on('web_app_data', async (ctx) => {
       'Пожалуйста, прикрепите сюда 3–5 фото высыпаний (хорошее освещение, фокус, общий план + крупный план).'
     );
 
-    // Форвард тебе (врачу)
+    // Уведомление врачу
     if (ADMIN_ID) {
-      await ctx.telegram.sendMessage(ADMIN_ID, `👤 От: @${ctx.from.username || '—'} (id ${ctx.from.id})\n${pretty}`);
+      await ctx.telegram.sendMessage(
+        ADMIN_ID,
+        `👤 От: @${ctx.from.username || '—'} (id ${ctx.from.id})\n${prettyCard(d)}`
+      );
     }
 
-    // Кнопка "Оплатить" / "QR"
+    // QR или кнопка «Я оплатил(а)»
     if (PAYMENT_QR_URL) {
       await ctx.replyWithPhoto(PAYMENT_QR_URL, {
         caption: 'Оплата консультации: отсканируйте QR код. После оплаты нажмите кнопку ниже.',
@@ -78,55 +123,44 @@ bot.on('web_app_data', async (ctx) => {
       });
     } else {
       await ctx.reply(
-        'Ссылка/QR для оплаты пока не подключены. После оплаты нажмите «Я оплатил(а)».',
-        Markup.inlineKeyboard([[Markup.button.callback('Я оплатил(а)', 'paid_yes')]])
+        'Ссылка/QR для оплаты будет подключена. После оплаты нажмите «Я оплатил(а)».',
+        { reply_markup: { inline_keyboard: [[{ text: 'Я оплатил(а)', callback_data: 'paid_yes' }]] } }
       );
     }
+
   } catch (e) {
-    console.error(e);
-    await ctx.reply('Произошла ошибка при обработке заявки. Напишите, пожалуйста, в этот чат ваши данные вручную.');
+    console.error('[web_app_data] parse error', e);
+    await ctx.reply('Произошла ошибка при обработке заявки. Напишите, пожалуйста, данные вручную.');
   }
 });
 
 // ====== Приём фото ======
 bot.on('photo', async (ctx) => {
-  // Просто подтверждаем получение. Файлы можно будет скачивать по FileID,
-  // но без БД сейчас сохраняем только факт/уведомление.
   await ctx.reply('Фото получено ✅ Пришлите ещё 2–4 фото при необходимости, затем нажмите «Я оплатил(а)».');
 
-  // Уведомим врача
   if (ADMIN_ID) {
-    const largest = ctx.message.photo[ctx.message.photo.length - 1];
-    await ctx.telegram.sendPhoto(ADMIN_ID, largest.file_id, { caption: `📷 Фото от @${ctx.from.username || '—'} (id ${ctx.from.id})` });
+    try {
+      const largest = ctx.message.photo[ctx.message.photo.length - 1];
+      await ctx.telegram.sendPhoto(ADMIN_ID, largest.file_id, {
+        caption: `📷 Фото от @${ctx.from.username || '—'} (id ${ctx.from.id})`
+      });
+    } catch (e) {
+      console.error('Forward photo error:', e);
+    }
   }
 });
 
-// ====== Подтверждение оплаты ======
+// ====== Подтверждение оплаты → выбор слотов ======
 bot.action('paid_yes', async (ctx) => {
   await ctx.answerCbQuery();
+
+  // Попробуем обновить подпись к фото с QR (если была)
   await ctx.editMessageCaption?.({
     caption: 'Оплата подтверждена ✅',
     reply_markup: { inline_keyboard: [] }
-  }).catch(() => {}); // если сообщение без фото — просто игнорируем
+  }).catch(() => { /* если не фото — игнорируем */ });
 
-  // Предлагаем слоты (заготовка — можно заменить на свою логику)
-  const today = new Date();
-  const slot = (offsetDays, h, m) => {
-    const d = new Date(today);
-    d.setDate(today.getDate() + offsetDays);
-    d.setHours(h, m, 0, 0);
-    const dd = String(d.getDate()).padStart(2, '0');
-    const mm = String(d.getMonth()+1).padStart(2, '0');
-    const hh = String(h).padStart(2, '0');
-    const mi = String(m).padStart(2, '0');
-    return { label: `${dd}.${mm} ${hh}:${mi}`, data: `slot_${d.getTime()}` };
-  };
-
-  const slots = [
-    slot(0, 18, 30), slot(1, 12, 0), slot(1, 19, 0),
-    slot(2, 11, 30), slot(2, 16, 0)
-  ];
-
+  const slots = makeSlots();
   await ctx.reply(
     'Спасибо! Выберите удобное время (предварительно):',
     {
@@ -139,7 +173,6 @@ bot.action('paid_yes', async (ctx) => {
     }
   );
 
-  // Уведомим врача
   if (ADMIN_ID) {
     await ctx.telegram.sendMessage(ADMIN_ID, `💳 @${ctx.from.username || '—'} подтвердил(а) оплату. ID: ${ctx.from.id}`);
   }
@@ -149,7 +182,7 @@ bot.action(/slot_\d+/, async (ctx) => {
   await ctx.answerCbQuery();
   const when = new Date(Number(ctx.match[0].split('_')[1]));
   const dd = String(when.getDate()).padStart(2, '0');
-  const mm = String(when.getMonth()+1).padStart(2, '0');
+  const mm = String(when.getMonth() + 1).padStart(2, '0');
   const hh = String(when.getHours()).padStart(2, '0');
   const mi = String(when.getMinutes()).padStart(2, '0');
 
@@ -168,17 +201,15 @@ bot.action('slot_other', async (ctx) => {
   }
 });
 
-// ====== Запуск (Polling) ======
-// Для Railway проще всего оставить long polling.
-// Если захочешь webhook — скажу, что включить в settings.
+// ====== Запуск бота (long polling) ======
 bot.launch();
-console.log('ARI bot started');
+console.log('✅ ARI bot started');
 
-// Грейсфул-шатдаун
+// Graceful shutdown
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
 
-// ====== Пустой express для здоровья на Railway (не обязателен, но полезен)
+// ====== Мини-Express сервер для health-check на Railway ======
 const app = express();
 app.get('/', (_req, res) => res.send('ARI bot is running'));
 const PORT = process.env.PORT || 3000;
