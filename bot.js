@@ -1,173 +1,185 @@
-import 'dotenv/config';
+import express from 'express';
 import { Telegraf, Markup } from 'telegraf';
 
-/** ===== ARI CONFIG ===== **/
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const WEBAPP_URL = process.env.WEBAPP_URL;        // публичный URL сайта ARI с Railway
-const ADMIN_CHAT_ID = Number(process.env.ADMIN_CHAT_ID); // твой Telegram numeric id
+// ====== ENV ======
+const BOT_TOKEN      = process.env.BOT_TOKEN;        // токен @BotFather
+const ADMIN_ID       = Number(process.env.ADMIN_ID); // твой Telegram ID (получишь через /id)
+const SITE_URL       = process.env.SITE_URL || 'https://independent-intuition-production.up.railway.app/';
+const PAYMENT_QR_URL = process.env.PAYMENT_QR_URL || ''; // прямая ссылка на картинку твоего QR
 
-if (!BOT_TOKEN) throw new Error('BOT_TOKEN is required');
-if (!WEBAPP_URL) throw new Error('WEBAPP_URL is required');
+if (!BOT_TOKEN) {
+  console.error('Missing BOT_TOKEN env');
+  process.exit(1);
+}
 
 const bot = new Telegraf(BOT_TOKEN);
 
-/** ===== In-memory ===== **/
-const photoPromptByChat = new Map();   // chatId -> messageId «попросить фото»
-const dateState = new Map();           // chatId -> { step, date, time }
+// ====== Команды ======
+bot.start(async (ctx) => {
+  await ctx.reply(
+    'Привет! Это ARI — онлайн-консультации дерматолога.\n\n' +
+    '1) Нажмите кнопку ниже, заполните короткую анкету\n' +
+    '2) Прикрепите фото высыпаний здесь в чате\n' +
+    '3) Оплатите по QR и подтвердите оплату\n' +
+    '4) Я предложу время консультации',
+    Markup.inlineKeyboard([
+      [Markup.button.webApp('Открыть анкету', SITE_URL)]
+    ])
+  );
+});
 
-/** ===== Utils ===== **/
-const cut = (t='', n=220) => t ? (t.length>n ? t.slice(0,n)+'…' : t) : '—';
-const userDeepLink = (u) => u?.username ? `https://t.me/${u.username}` : `tg://user?id=${u?.id}`;
+bot.command('id', async (ctx) => {
+  await ctx.reply(`Ваш Telegram ID: \`${ctx.from.id}\``, { parse_mode: 'Markdown' });
+});
 
-function slotDays(n=5){
-  const base = new Date(); const arr=[];
-  for(let i=0;i<n;i++){ const d=new Date(base); d.setDate(base.getDate()+i); arr.push(d); }
-  return arr;
-}
-const dayLabel = (d) => d.toLocaleDateString('ru-RU',{weekday:'short', day:'2-digit', month:'2-digit'});
-
-function buildDayKeyboard(){
-  const days = slotDays(5);
-  const row = days.map(d => Markup.button.callback(dayLabel(d), `pick_day:${d.toISOString().slice(0,10)}`));
-  return Markup.inlineKeyboard([row, [Markup.button.callback('Отмена','pick_cancel')]]);
-}
-function buildTimeKeyboard(iso){
-  const times = ['10:00','12:00','15:00','18:00'];
-  const row = times.map(t => Markup.button.callback(t, `pick_time:${iso}:${t}`));
-  return Markup.inlineKeyboard([row, [Markup.button.callback('Назад','pick_back'), Markup.button.callback('Отмена','pick_cancel')]]);
-}
-
-/** ===== Команды ===== **/
-bot.start((ctx) => ctx.reply(
-  'Онлайн-заявка ARI',
-  Markup.inlineKeyboard([[Markup.button.webApp('Открыть форму', WEBAPP_URL)]])
-));
-bot.command('consult', (ctx) => ctx.reply(
-  'Открыть форму',
-  Markup.inlineKeyboard([[Markup.button.webApp('Онлайн-заявка ARI', WEBAPP_URL)]])
-));
-bot.command('help', (ctx) => ctx.reply(
-  'Команды:\n/consult — открыть форму\n/help — помощь\n/price — стоимость/условия'
-));
-bot.command('price', (ctx) => ctx.reply(
-  'Стоимость первичной онлайн-оценки: ₽ (QR в форме).\nНе заменяет очный приём; при «красных флагах» — очно.'
-));
-
-/** ===== Данные из WebApp ===== **/
+// ====== Обработка WebApp данных (после sendData(JSON) со страницы) ======
 bot.on('web_app_data', async (ctx) => {
   try {
-    const payload = JSON.parse(ctx.webAppData.data); // { type, version, data }
-    const d = payload?.data || {};
-    const user = ctx.from;
+    const raw = ctx.message.web_app_data?.data;
+    const payload = JSON.parse(raw || '{}');
 
-    // Пациенту: подтверждение + просьба приложить фото + «Выбрать дату»
-    const m = await ctx.reply(
-      '✅ Заявка получена.\n' +
-      '💳 Оплата: подтверждена\n' +
-      '📎 Прикрепите, пожалуйста, 2–5 фото ответом на это сообщение ' +
-      '(общий план + крупный план при дневном рассеянном свете).',
-      { reply_markup: { inline_keyboard: [[{ text:'Выбрать дату', callback_data:'pick_date' }]] } }
+    if (payload?.type !== 'ari_request') {
+      return ctx.reply('Получен неизвестный формат данных.');
+    }
+
+    const d = payload.data || {};
+    const pretty = [
+      `📨 Новая заявка ARI`,
+      `ФИО: ${d.fio || '—'}`,
+      `Дата рождения: ${d.dob || '—'}`,
+      `Email: ${d.email || '—'}`,
+      `Жалобы: ${d.complaints || '—'}`,
+      `Анамнез заболевания: ${d.hx_disease || '—'}`,
+      `Анамнез жизни: ${d.hx_life || '—'}`,
+      `Хронические: ${d.chronic || '—'}`,
+      `Лекарства: ${d.meds || '—'}`,
+      `Аллергии: ${d.allergy || '—'}`,
+      `Ранее лечение: ${d.prev_tx || '—'}`
+    ].join('\n');
+
+    // Сообщение пациенту
+    await ctx.reply(
+      'Спасибо! Заявка получена ✅\n' +
+      'Пожалуйста, прикрепите сюда 3–5 фото высыпаний (хорошее освещение, фокус, общий план + крупный план).'
     );
-    photoPromptByChat.set(ctx.chat.id, m.message_id);
 
-    // Врачу (тебе) — карточка
-    if (ADMIN_CHAT_ID) {
-      await ctx.telegram.sendMessage(
-        ADMIN_CHAT_ID,
-        '🆕 Новая заявка (ARI)\n' +
-        `• Пациент: ${d.fio || '—'}\n` +
-        `• ДР: ${d.dob || '—'}\n` +
-        `• Жалобы: ${cut(d.complaints)}\n` +
-        `• Оплата: ✅\n` +
-        `• Фото: ожидаются\n\n` +
-        `userId: ${user.id} (@${user.username || '—'})`,
-        {
-          reply_markup: {
-            inline_keyboard: [
-              [{ text:'Открыть диалог', url: userDeepLink(user) }],
-              [{ text:'Попросить фото', callback_data:`nudge_photo:${ctx.chat.id}` }],
-              [{ text:'Выбрать дату', callback_data:`admin_pick_date:${ctx.chat.id}` }]
-            ]
-          }
+    // Форвард тебе (врачу)
+    if (ADMIN_ID) {
+      await ctx.telegram.sendMessage(ADMIN_ID, `👤 От: @${ctx.from.username || '—'} (id ${ctx.from.id})\n${pretty}`);
+    }
+
+    // Кнопка "Оплатить" / "QR"
+    if (PAYMENT_QR_URL) {
+      await ctx.replyWithPhoto(PAYMENT_QR_URL, {
+        caption: 'Оплата консультации: отсканируйте QR код. После оплаты нажмите кнопку ниже.',
+        reply_markup: {
+          inline_keyboard: [[{ text: 'Я оплатил(а)', callback_data: 'paid_yes' }]]
         }
+      });
+    } else {
+      await ctx.reply(
+        'Ссылка/QR для оплаты пока не подключены. После оплаты нажмите «Я оплатил(а)».',
+        Markup.inlineKeyboard([[Markup.button.callback('Я оплатил(а)', 'paid_yes')]])
       );
     }
   } catch (e) {
-    console.error('web_app_data error', e);
-    await ctx.reply('⚠️ Не удалось обработать данные. Попробуйте ещё раз.');
+    console.error(e);
+    await ctx.reply('Произошла ошибка при обработке заявки. Напишите, пожалуйста, в этот чат ваши данные вручную.');
   }
 });
 
-/** ===== Фото: принимаем как ответ на «приглашатель фото» ===== **/
+// ====== Приём фото ======
 bot.on('photo', async (ctx) => {
-  try {
-    const promptId = photoPromptByChat.get(ctx.chat.id);
-    const replyTo = ctx.message?.reply_to_message?.message_id;
-    if (promptId && replyTo === promptId) {
-      await ctx.reply('✅ Фото получены, спасибо! Я свяжусь с вами по итогам оценки.');
-      if (ADMIN_CHAT_ID) {
-        await ctx.forwardMessage(ADMIN_CHAT_ID, ctx.chat.id, ctx.message.message_id);
+  // Просто подтверждаем получение. Файлы можно будет скачивать по FileID,
+  // но без БД сейчас сохраняем только факт/уведомление.
+  await ctx.reply('Фото получено ✅ Пришлите ещё 2–4 фото при необходимости, затем нажмите «Я оплатил(а)».');
+
+  // Уведомим врача
+  if (ADMIN_ID) {
+    const largest = ctx.message.photo[ctx.message.photo.length - 1];
+    await ctx.telegram.sendPhoto(ADMIN_ID, largest.file_id, { caption: `📷 Фото от @${ctx.from.username || '—'} (id ${ctx.from.id})` });
+  }
+});
+
+// ====== Подтверждение оплаты ======
+bot.action('paid_yes', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.editMessageCaption?.({
+    caption: 'Оплата подтверждена ✅',
+    reply_markup: { inline_keyboard: [] }
+  }).catch(() => {}); // если сообщение без фото — просто игнорируем
+
+  // Предлагаем слоты (заготовка — можно заменить на свою логику)
+  const today = new Date();
+  const slot = (offsetDays, h, m) => {
+    const d = new Date(today);
+    d.setDate(today.getDate() + offsetDays);
+    d.setHours(h, m, 0, 0);
+    const dd = String(d.getDate()).padStart(2, '0');
+    const mm = String(d.getMonth()+1).padStart(2, '0');
+    const hh = String(h).padStart(2, '0');
+    const mi = String(m).padStart(2, '0');
+    return { label: `${dd}.${mm} ${hh}:${mi}`, data: `slot_${d.getTime()}` };
+  };
+
+  const slots = [
+    slot(0, 18, 30), slot(1, 12, 0), slot(1, 19, 0),
+    slot(2, 11, 30), slot(2, 16, 0)
+  ];
+
+  await ctx.reply(
+    'Спасибо! Выберите удобное время (предварительно):',
+    {
+      reply_markup: {
+        inline_keyboard: [
+          ...slots.map(s => [{ text: s.label, callback_data: s.data }]),
+          [{ text: 'Другое время', callback_data: 'slot_other' }]
+        ]
       }
     }
-  } catch(e){ console.error('photo error', e); }
-});
-
-/** ===== Выбор даты (пациент) ===== **/
-bot.action('pick_date', async (ctx) => {
-  dateState.set(ctx.chat.id, { step:'day' });
-  await ctx.editMessageReplyMarkup(buildDayKeyboard().reply_markup).catch(()=>{});
-  await ctx.answerCbQuery();
-});
-bot.action(/pick_day:(\d{4}-\d{2}-\d{2})/, async (ctx) => {
-  const iso = ctx.match[1];
-  dateState.set(ctx.chat.id, { step:'time', date: iso });
-  await ctx.editMessageReplyMarkup(buildTimeKeyboard(iso).reply_markup).catch(()=>{});
-  await ctx.answerCbQuery(dayLabel(new Date(iso)));
-});
-bot.action(/pick_time:(\d{4}-\d{2}-\d{2}):(\d{2}:\d{2})/, async (ctx) => {
-  const [, iso, time] = ctx.match;
-  dateState.set(ctx.chat.id, { step:'done', date: iso, time });
-  await ctx.editMessageText(`📅 Вы выбрали: ${iso} в ${time}`).catch(()=>{});
-  await ctx.answerCbQuery('Слот выбран');
-
-  if (ADMIN_CHAT_ID) {
-    await ctx.telegram.sendMessage(
-      ADMIN_CHAT_ID,
-      `📅 Пациент выбрал слот: ${iso} в ${time}\nchatId: ${ctx.chat.id}`,
-      { reply_markup: { inline_keyboard: [[{ text:'Открыть диалог', url: userDeepLink(ctx.from) }]] } }
-    );
-  }
-});
-bot.action('pick_back', async (ctx) => {
-  const st = dateState.get(ctx.chat.id);
-  if (st?.step === 'time') {
-    await ctx.editMessageReplyMarkup(buildDayKeyboard().reply_markup).catch(()=>{});
-    dateState.set(ctx.chat.id, { step:'day' });
-  }
-  await ctx.answerCbQuery();
-});
-bot.action('pick_cancel', async (ctx) => {
-  dateState.delete(ctx.chat.id);
-  await ctx.editMessageText('Выбор даты отменён.').catch(()=>{});
-  await ctx.answerCbQuery('Отменено');
-});
-
-/** ===== Кнопки для врача ===== **/
-bot.action(/nudge_photo:(\d+)/, async (ctx) => {
-  const chatId = Number(ctx.match[1]);
-  await ctx.answerCbQuery('Запрос отправлен');
-  await ctx.telegram.sendMessage(
-    chatId,
-    '📎 Пожалуйста, прикрепите 2–5 фото ответом на это сообщение (общий план + крупный план при дневном рассеянном свете).'
   );
-});
-bot.action(/admin_pick_date:(\d+)/, async (ctx) => {
-  const chatId = Number(ctx.match[1]);
-  await ctx.answerCbQuery();
-  await ctx.telegram.sendMessage(chatId, 'Давайте выберем дату консультации:', buildDayKeyboard());
+
+  // Уведомим врача
+  if (ADMIN_ID) {
+    await ctx.telegram.sendMessage(ADMIN_ID, `💳 @${ctx.from.username || '—'} подтвердил(а) оплату. ID: ${ctx.from.id}`);
+  }
 });
 
-/** ===== Запуск ===== **/
-bot.launch().then(() => console.log('ARI bot started'));
+bot.action(/slot_\d+/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const when = new Date(Number(ctx.match[0].split('_')[1]));
+  const dd = String(when.getDate()).padStart(2, '0');
+  const mm = String(when.getMonth()+1).padStart(2, '0');
+  const hh = String(when.getHours()).padStart(2, '0');
+  const mi = String(when.getMinutes()).padStart(2, '0');
+
+  await ctx.editMessageText(`Предварительно выбрано: ${dd}.${mm} ${hh}:${mi}. Я свяжусь с вами для подтверждения.`);
+
+  if (ADMIN_ID) {
+    await ctx.telegram.sendMessage(ADMIN_ID, `🗓 Пациент @${ctx.from.username || '—'} выбрал слот ${dd}.${mm} ${hh}:${mi}`);
+  }
+});
+
+bot.action('slot_other', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.editMessageText('Напишите, пожалуйста, удобные для вас дни и время — я подберу ближайшее доступное окно.');
+  if (ADMIN_ID) {
+    await ctx.telegram.sendMessage(ADMIN_ID, `🗓 Пациент @${ctx.from.username || '—'} попросил другое время.`);
+  }
+});
+
+// ====== Запуск (Polling) ======
+// Для Railway проще всего оставить long polling.
+// Если захочешь webhook — скажу, что включить в settings.
+bot.launch();
+console.log('ARI bot started');
+
+// Грейсфул-шатдаун
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+// ====== Пустой express для здоровья на Railway (не обязателен, но полезен)
+const app = express();
+app.get('/', (_req, res) => res.send('ARI bot is running'));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('Health server on', PORT));
