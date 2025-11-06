@@ -1,6 +1,3 @@
-// index.js — ARI Telegram Bot (Node.js + Telegraf)
-// Работает на long polling (без вебхуков). Готов к Railway.
-// ВАЖНО: Проверь переменные окружения в Railway: BOT_TOKEN, ADMIN_ID, SITE_URL, PAYMENT_QR_URL
 
 import express from 'express';
 import { Telegraf, Markup } from 'telegraf';
