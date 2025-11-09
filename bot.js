@@ -1,9 +1,10 @@
-// ARI — Telegram bot (без Cal.com, с WebApp-слотом)
-// Поток: согласие → жалобы → анамнез → ≥3 фото → оплата (QR) → кнопка “Открыть форму” (WebApp /datetime)
-// WebApp отправляет { datetimeISO, note } через Telegram.WebApp.sendData → бот отвечает пациенту и шлёт карточку в канал
+// ARI — Telegram bot (WebApp-слоты без Cal.com)
+// Поток: согласие → жалобы → анамнез → ≥3 фото → оплата (QR) → WebApp /datetime → бот подтверждает пациенту и шлёт карточку в админ-канал
 // Node >= 20; deps: telegraf, express, dayjs
 
 import express from "express";
+import path from "path";
+import { fileURLToPath } from "url";
 import { Telegraf, Markup, Scenes, session } from "telegraf";
 import dayjs from "dayjs";
 import utc from "dayjs/plugin/utc.js";
@@ -11,27 +12,41 @@ dayjs.extend(utc);
 
 // ===== ENV =====
 const BOT_TOKEN      = process.env.BOT_TOKEN;
-const ADMIN_CHAT_ID  = process.env.ADMIN_CHAT_ID;                 // -100... (канал/группа, где бот — админ)
-const PAYMENT_QR_URL = process.env.PAYMENT_QR_URL || "";          // картинка QR на 3500 ₽
-const WEBAPP_URL     = process.env.WEBAPP_URL || "";              // https://<railway>/datetime
-const PRICE_RUB      = Number(process.env.PRICE_RUB || 3500);
+const ADMIN_CHAT_ID  = process.env.ADMIN_CHAT_ID;                // -100... (канал/группа, бот должен быть админом)
+const PAYMENT_QR_URL = process.env.PAYMENT_QR_URL || "";         // URL картинки QR на оплату
+const WEBAPP_URL     = process.env.WEBAPP_URL || "";             // https://<railway>/datetime
+const PRICE_RUB      = Number(process.env.PRICE_RUB || 3500);    // стоимость консультации
 const TZ             = process.env.TZ || "Europe/Berlin";
+const PORT           = process.env.PORT || 3000;
 
-if (!BOT_TOKEN) { console.error("❌ Missing BOT_TOKEN"); process.exit(1); }
-if (!ADMIN_CHAT_ID) { console.error("❌ Missing ADMIN_CHAT_ID"); process.exit(1); }
+if (!BOT_TOKEN)      { console.error("❌ Missing BOT_TOKEN");      process.exit(1); }
+if (!ADMIN_CHAT_ID)  { console.error("❌ Missing ADMIN_CHAT_ID");  process.exit(1); }
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// ===== Отправка карточек ТОЛЬКО в канал =====
+// ===== Быстрая отправка в канал (не блокируем ответы пациенту) =====
 async function sendToAdmins(telegram, payload, photos = []) {
-  try {
-    await telegram.sendMessage(ADMIN_CHAT_ID, payload, { disable_web_page_preview: true });
-    for (const f of photos) {
-      await telegram.sendPhoto(ADMIN_CHAT_ID, f).catch(() => {});
-    }
-  } catch (e) {
-    console.warn("admin send warn:", e.message);
+  const tasks = [];
+
+  // текст — отдельным сообщением
+  tasks.push(
+    telegram.sendMessage(ADMIN_CHAT_ID, payload, { disable_web_page_preview: true }).catch(() => {})
+  );
+
+  // фото — медиагруппой (до 10) или одним фото
+  if (photos.length > 1) {
+    const media = photos.slice(0, 10).map((fileId, i) => ({
+      type: "photo",
+      media: fileId,
+      ...(i === 0 ? { caption: "Фото по заявке" } : {})
+    }));
+    tasks.push(bot.telegram.sendMediaGroup(ADMIN_CHAT_ID, media).catch(() => {}));
+  } else if (photos.length === 1) {
+    tasks.push(bot.telegram.sendPhoto(ADMIN_CHAT_ID, photos[0], { caption: "Фото по заявке" }).catch(() => {}));
   }
+
+  // выполняем в фоне
+  Promise.allSettled(tasks);
 }
 
 // ===== Тексты (юридика кратко) =====
@@ -66,7 +81,7 @@ function summarize(ctx) {
     "📨 Новая заявка ARI",
     `Пациент: @${ctx.from?.username || "—"} (id ${ctx.from?.id})`,
     `Жалобы: ${prettify(d.complaints)}`,
-    `Анамнез заболевания: ${prettify(d.hxDisease)}`,
+    `Анамнез заболевания: ${prettify(d.hxDisease)}`
   ];
   if (d.photos?.length) parts.push(`Фото: ${d.photos.length} шт.`);
   if (d.paid) parts.push("💳 Оплата подтверждена");
@@ -118,7 +133,9 @@ const wizard = new WizardScene(
   async (ctx) => {
     if (!ctx.message?.text) { await ctx.reply("Пожалуйста, напишите текстом."); return; }
     ctx.session.ari.complaints = ctx.message.text.trim();
-    await ctx.reply("Опишите анамнез заболевания: начало, динамика, что уже пробовали (препараты/дозы/длительность), переносимость.");
+    await ctx.reply(
+      "Опишите анамнез заболевания: начало, динамика, что уже пробовали (препараты/дозы/длительность), переносимость."
+    );
     return ctx.wizard.next();
   },
 
@@ -171,13 +188,14 @@ const wizard = new WizardScene(
       await ctx.reply("✅ Оплата подтверждена. Напишите удобные дни/время текстом — подберу ближайшее окно.");
     }
 
-    // Уведомить канал о факте оплаты и предыдущих данных (без слота)
-    await sendToAdmins(ctx.telegram, summarize(ctx), ctx.session.ari.photos || []);
+    // уведомляем канал о факте оплаты и ранее собранных данных — НЕ блокируем ответ пациенту
+    sendToAdmins(ctx.telegram, summarize(ctx), ctx.session.ari.photos || []);
+
     return ctx.scene.leave();
   }
 );
 
-// ===== Инициализация сцен =====
+// ===== Инициализация сцен и middleware =====
 const stage = new Stage([wizard]);
 bot.use(session());
 bot.use(stage.middleware());
@@ -194,27 +212,24 @@ bot.command("id", (ctx) => ctx.reply(`Ваш Telegram ID: ${ctx.from.id}`));
 // tg.sendData(JSON.stringify({ datetimeISO, note }))
 bot.on("message", async (ctx) => {
   const raw = ctx.message?.web_app_data?.data;
-  if (!raw) return;
+  if (!raw) return; // не мешаем обычной переписке
 
   try {
     const { datetimeISO, note } = JSON.parse(raw || "{}");
-    // Для единообразия логов — дублируем UTC-время:
     const utcISO = dayjs(datetimeISO).utc().format("YYYY-MM-DD HH:mm");
 
-    // Сохраним в сессию (если есть)
+    // сохраняем в сессию
     ctx.session.ari = ctx.session.ari || { photos: [] };
     ctx.session.ari.slot = datetimeISO;
     ctx.session.ari.note = note || "";
 
-    // Ответ пациенту
+    // мгновенный ответ пациенту
     await ctx.reply(
-      `🕒 Запрос на слот получен!\n` +
-      `Дата и время: *${datetimeISO}* (${TZ})\n` +
-      `Мы подтвердим встречу в ближайшее время.`,
+      `🕒 Запрос на слот получен!\nДата и время: *${datetimeISO}* (${TZ})\nМы подтвердим встречу в ближайшее время.`,
       { parse_mode: "Markdown" }
     );
 
-    // Карточка в канал (одно сообщение + фото)
+    // карточка в канал (в фоне)
     const card = [
       "📬 *Новая запись на консультацию*",
       `Пациент: @${ctx.from?.username || ctx.from?.id}`,
@@ -224,7 +239,7 @@ bot.on("message", async (ctx) => {
       `💬 Chat ID: \`${ctx.chat.id}\``
     ].join("\n");
 
-    await sendToAdmins(ctx.telegram, card, ctx.session.ari.photos || []);
+    sendToAdmins(ctx.telegram, card, ctx.session.ari.photos || []);
   } catch (e) {
     console.error(e);
     await ctx.reply("Упс, техническая ошибка. Попробуйте ещё раз.");
@@ -233,21 +248,36 @@ bot.on("message", async (ctx) => {
 
 // ===== Express: WebApp и health-check =====
 const app = express();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = path.dirname(__filename);
 
-// отдать статический datetime.html (расположи рядом с index.js)
+// раздача статики (+ возможные будущие css/js), кешируем
+app.use(express.static(__dirname, { maxAge: "1h", etag: true }));
+
+// мини-страница Telegram WebApp
 app.get("/datetime", (_req, res) => {
-  res.sendFile(process.cwd() + "/datetime.html");
+  res.set("Cache-Control", "public, max-age=300");
+  res.sendFile(path.join(__dirname, "datetime.html"));
 });
 
 // health
 app.get("/", (_req, res) => res.send("ARI bot running ✅"));
 
-const PORT = process.env.PORT || 3000;
+// ===== Запуск: чистим вебхук, отрезаем хвост, ограничиваем апдейты =====
+(async () => {
+  try {
+    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+  } catch (e) {
+    console.warn("Webhook delete warn:", e.message);
+  }
 
-// Поллинг (если ранее использовал webhook — он будет переведён Telegraf-ом автоматически)
-bot.launch();
-app.listen(PORT, () => console.log("✅ ARI bot + WebApp listening on", PORT));
+  await bot.launch({
+    dropPendingUpdates: true,
+    allowedUpdates: ["message", "callback_query"]
+  });
+
+  app.listen(PORT, () => console.log("✅ ARI bot + WebApp listening on", PORT));
+})();
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
-
