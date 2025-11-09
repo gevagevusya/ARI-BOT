@@ -1,18 +1,18 @@
-// index.js — ARI Telegram Bot (QR 3500 ₽ + Cal.com redirect + /id + fallback + admin channel)
-// Поток: согласие → жалобы → анамнез заболевания → фото → QR → "Я оплатил(а)" → Cal.com (?tgid=...) → redirect в бота (/start booked)
-// ENV: BOT_TOKEN, ADMIN_ID (опц), ADMIN_CHANNEL (опц), PAYMENT_QR_URL, CAL_BOOKING_URL
-// Требования: Node >= 20; deps: telegraf, express
+// index.js — ARI Telegram Bot (QR 3500 ₽ + Cal.com redirect confirm_* + /id + admin channel)
+// ENV: BOT_TOKEN, ADMIN_ID (opt), ADMIN_CHANNEL (opt), PAYMENT_QR_URL, CAL_BOOKING_URL, MEETING_URL
+// Node >= 20; deps: telegraf, express
 
 import express from 'express';
 import { Telegraf, Markup, Scenes, session } from 'telegraf';
 
 // ===== ENV =====
-const BOT_TOKEN        = process.env.BOT_TOKEN;
-const ADMIN_ID         = process.env.ADMIN_ID ? Number(process.env.ADMIN_ID) : undefined;             // личный ID (человек)
-const ADMIN_CHANNEL    = process.env.ADMIN_CHANNEL ? Number(process.env.ADMIN_CHANNEL) : undefined;   // ID канала/группы (-100…)
-const PAYMENT_QR_URL   = process.env.PAYMENT_QR_URL || '';       // прямая ссылка на PNG/JPG QR оплаты
-const CAL_BOOKING_URL  = process.env.CAL_BOOKING_URL || '';      // https://cal.com/yourname/event
-const PRICE_RUB        = 3500;
+const BOT_TOKEN       = process.env.BOT_TOKEN;
+const ADMIN_ID        = process.env.ADMIN_ID ? Number(process.env.ADMIN_ID) : undefined;
+const ADMIN_CHANNEL   = process.env.ADMIN_CHANNEL ? Number(process.env.ADMIN_CHANNEL) : undefined;
+const PAYMENT_QR_URL  = process.env.PAYMENT_QR_URL || '';
+const CAL_BOOKING_URL = process.env.CAL_BOOKING_URL || '';
+const MEETING_URL     = process.env.MEETING_URL || 'https://telemost.yandex.ru/'; // можно заменить в ENV
+const PRICE_RUB       = 3500;
 
 if (!BOT_TOKEN) { console.error('❌ Missing BOT_TOKEN'); process.exit(1); }
 
@@ -29,7 +29,7 @@ async function sendToAdmins(telegram, payload, photos = []) {
   const targets = getAdminTargets();
   for (const chatId of targets) {
     try {
-      await telegram.sendMessage(chatId, payload);
+      await telegram.sendMessage(chatId, payload, { disable_web_page_preview: true });
       for (const f of photos) {
         await telegram.sendPhoto(chatId, f).catch(()=>{});
       }
@@ -77,6 +77,50 @@ function summarize(ctx){
   if (d.photos?.length) parts.push(`Фото: ${d.photos.length} шт.`);
   if (d.paid) parts.push('Оплата: подтверждена пользователем');
   return parts.join('\n');
+}
+
+// ru-формат даты: «12 ноября 14:00 (Europe/Moscow)»
+function formatRuDate(date, tz = 'Europe/Moscow') {
+  try {
+    const d = new Date(date);
+    const fmt = new Intl.DateTimeFormat('ru-RU', {
+      timeZone: tz,
+      day: '2-digit', month: 'long', hour: '2-digit', minute: '2-digit'
+    });
+    return fmt.format(d);
+  } catch { return null; }
+}
+
+// Парсим payload из /start confirm_...
+// Поддерживаем несколько форматов:
+// 1) confirm_2025-11-12T14:00:00+03:00
+// 2) confirm_20251112_1400
+// 3) confirm-epoch-1699780800000
+function parseConfirmPayload(p) {
+  if (!p) return null;
+  if (!/^confirm[_-]/i.test(p)) return null;
+
+  const rest = decodeURIComponent(p.replace(/^confirm[_-]/i, '')).trim();
+
+  // epoch миллисекундами
+  if (/^epoch[-_]\d{10,}$/.test(rest)) {
+    const ms = Number(rest.replace(/^epoch[-_]/, ''));
+    if (Number.isFinite(ms)) return { iso: new Date(ms).toISOString(), tz: 'Europe/Moscow' };
+  }
+
+  // ISO
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(rest)) {
+    return { iso: rest, tz: 'Europe/Moscow' };
+  }
+
+  // YYYYMMDD_HHmm
+  const m = rest.match(/^(\d{4})(\d{2})(\d{2})[_-]?(\d{2})(\d{2})$/);
+  if (m) {
+    const iso = `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:00`;
+    return { iso, tz: 'Europe/Moscow' };
+  }
+
+  return null;
 }
 
 // ===== Сцены =====
@@ -196,41 +240,75 @@ const wizard = new WizardScene(
       await ctx.reply('Оплата подтверждена ✅. Напишите удобные дни/время — подберу ближайшее окно.');
     }
 
-    // админ-уведомление
     await sendToAdmins(ctx.telegram, summarize(ctx), (ctx.session.ari.photos || []));
-
     await ctx.reply('Спасибо! После выбора времени пришлю подтверждение.');
     return ctx.scene.leave();
   }
 );
 
 // ===== Сцены и middleware =====
+const { WizardScene: _W, Stage } = Scenes;
 const stage = new Stage([wizard]);
 bot.use(session());
 bot.use(stage.middleware());
 
 // ===== Команды =====
 
-// /start с deep-link параметром (например, /start booked)
+// /start с deep-link параметром (например, /start confirm_2025-11-12T14:00:00+03:00)
 bot.start(async (ctx) => {
-  const payload = (ctx.startPayload || '').trim().toLowerCase();
+  const payload = (ctx.startPayload || '').trim();
 
-  // Вернулись из Cal.com по Redirect
-  if (payload === 'booked') {
-    await ctx.reply(
-      'Запись получена ✅\nСпасибо! Я пришлю ссылку на телемост и уточню детали перед консультацией.'
+  // 1) Авто-подтверждение с датой: /start confirm_...
+  if (/^confirm[_-]/i.test(payload)) {
+    const parsed = parseConfirmPayload(payload);
+    if (parsed?.iso) {
+      const human = formatRuDate(parsed.iso) || parsed.iso;
+      await ctx.reply(
+        'Запись получена ✅\n' +
+        `📅 Время консультации: *${human}*\n` +
+        `🔗 Ссылка на телемост: [Перейти](${MEETING_URL})\n\n` +
+        'Пожалуйста, подключитесь за 5 минут до начала.',
+        { parse_mode: 'Markdown', disable_web_page_preview: true }
+      );
+
+      const d = ctx.session?.ari || {};
+      const card =
+        `📥 Автоподтверждение (deep-link)\n` +
+        `Пациент: @${ctx.from?.username || '—'} (id ${ctx.from?.id})\n` +
+        `Время: ${human}\n` +
+        `Жалобы: ${prettify(d.complaints)}\n` +
+        `Анамнез заболевания: ${prettify(d.hxDisease)}\n` +
+        (d.photos?.length ? `Фото: ${d.photos.length} шт.\n` : '');
+      await sendToAdmins(ctx.telegram, card, (d.photos || []));
+      return;
+    }
+
+    // Если Cal не подставил время — мягкий fallback
+    await ctx.reply('Запись получена ✅. Я пришлю точное время и ссылку на телемост в ближайшее время.');
+    const d = ctx.session?.ari || {};
+    await sendToAdmins(
+      ctx.telegram,
+      `📥 Подтверждение без времени (нет переменных в redirect)\n` +
+      `Пациент: @${ctx.from?.username || '—'} (id ${ctx.from?.id})\n` +
+      `Жалобы: ${prettify(d.complaints)}\n` +
+      `Анамнез заболевания: ${prettify(d.hxDisease)}`,
+      (d.photos || [])
     );
+    return;
+  }
 
+  // 2) Старый сценарий «просто бронировал» (без времени)
+  if (payload.toLowerCase() === 'booked') {
+    await ctx.reply('Запись получена ✅\nСпасибо! Я пришлю ссылку на телемост и уточню детали перед консультацией.');
     const d = ctx.session?.ari || {};
     const card =
-      `📥 Подтверждение через deep-link\n` +
+      `📥 Подтверждение через deep-link (без времени)\n` +
       `Пациент: @${ctx.from?.username || '—'} (id ${ctx.from?.id})\n` +
       `Жалобы: ${prettify(d.complaints)}\n` +
       `Анамнез заболевания: ${prettify(d.hxDisease)}\n` +
       (d.photos?.length ? `Фото: ${d.photos.length} шт.\n` : '');
-
     await sendToAdmins(ctx.telegram, card, (d.photos || []));
-    return; // не запускаем анкету заново
+    return;
   }
 
   // Обычный запуск анкеты
