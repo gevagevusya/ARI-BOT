@@ -1,5 +1,5 @@
 // ARI — Telegram bot (WebApp-слоты без Cal.com)
-// Поток: согласие → жалобы → анамнез → ≥3 фото → оплата (QR) → WebApp /datetime → бот подтверждает пациенту и шлёт карточку в админ-канал
+// Поток: согласие → жалобы → анамнез → ≥3 фото → оплата (QR) → WebApp /datetime → подтверждение и карточка в админ-канал
 // Node >= 20; deps: telegraf, express, dayjs
 
 import express from "express";
@@ -13,7 +13,7 @@ dayjs.extend(utc);
 // ===== ENV =====
 const BOT_TOKEN      = process.env.BOT_TOKEN;
 const ADMIN_CHAT_ID  = process.env.ADMIN_CHAT_ID;                // -100... (канал/группа, бот — админ)
-const PAYMENT_QR_URL = process.env.PAYMENT_QR_URL || "";         // URL картинки QR
+const PAYMENT_QR_URL = process.env.PAYMENT_QR_URL || "";         // HTTPS URL картинки QR
 const RAW_WEBAPP     = process.env.WEBAPP_URL || "";             // может быть с /datetime или без
 const PRICE_RUB      = Number(process.env.PRICE_RUB || 3500);
 const TZ             = process.env.TZ || "Europe/Berlin";
@@ -24,8 +24,8 @@ const WEBAPP_URL = RAW_WEBAPP.endsWith("/datetime")
   ? RAW_WEBAPP
   : RAW_WEBAPP.replace(/\/+$/, "") + "/datetime";
 
-if (!BOT_TOKEN)      { console.error("❌ Missing BOT_TOKEN");      process.exit(1); }
-if (!ADMIN_CHAT_ID)  { console.error("❌ Missing ADMIN_CHAT_ID");  process.exit(1); }
+if (!BOT_TOKEN)     { console.error("❌ Missing BOT_TOKEN");     process.exit(1); }
+if (!ADMIN_CHAT_ID) { console.error("❌ Missing ADMIN_CHAT_ID"); process.exit(1); }
 
 const bot = new Telegraf(BOT_TOKEN);
 
@@ -99,7 +99,7 @@ const wizard = new WizardScene(
   "ari",
   // Шаг 0 — приветствие и согласие
   async (ctx) => {
-    ctx.session.ari = { photos: [], paid: false, slot: null, note: "", paymentAsked: false };
+    ctx.session.ari = { photos: [], paid: false, slot: null, note: "", paymentAsked: false, _album: { t: null, id: null } };
     await ctx.reply(
       "Как это работает:\n" +
       "1) Опишете жалобы и анамнез заболевания\n" +
@@ -135,47 +135,94 @@ const wizard = new WizardScene(
   async (ctx) => {
     if (!ctx.message?.text) { await ctx.reply("Пожалуйста, напишите текстом."); return; }
     ctx.session.ari.complaints = ctx.message.text.trim();
-    await ctx.reply(
-      "Опишите анамнез заболевания: начало, динамика, что уже пробовали (препараты/дозы/длительность), переносимость."
-    );
+    await ctx.reply("Опишите анамнез заболевания: начало, динамика, что уже пробовали (препараты/дозы/длительность), переносимость.");
     return ctx.wizard.next();
   },
 
-  // Шаг 3 — фото (⚠️ фиксация: не спамим оплатой)
+  // Шаг 3 — фото (альбомы, анти-спам, гарантированный переход к оплате)
   async (ctx) => {
-    // если уже показывали оплату — игнорим лишние фото на этом шаге
-    if (ctx.session?.ari?.paymentAsked) return;
+    ctx.session.ari = ctx.session.ari || { photos: [], paid: false, slot: null, note: "", paymentAsked: false, _album: { t: null, id: null } };
+    const S = ctx.session.ari;
 
-    if (ctx.message?.photo?.length) {
-      const largest = ctx.message.photo.at(-1);
-      ctx.session.ari.photos.push(largest.file_id);
-      await ctx.reply(`Фото получено ✅ (${ctx.session.ari.photos.length})`);
-
-      if (ctx.session.ari.photos.length >= 3 && !ctx.session.ari.paymentAsked) {
-        // ставим флаг ДО отправки кнопок, чтобы исключить повторы при «залповой» отправке фото
-        ctx.session.ari.paymentAsked = true;
-
-        const kb = {
-          inline_keyboard: [[{ text: "Я оплатил(а)", callback_data: "paid_yes" }]]
-        };
-
-        if (PAYMENT_QR_URL) {
-          await ctx.replyWithPhoto(PAYMENT_QR_URL, {
-            caption: `Отлично! Фото достаточно.\n💳 Оплата консультации: ${PRICE_RUB} ₽\nОтсканируйте QR и нажмите кнопку ниже.`,
-            reply_markup: kb
-          });
-        } else {
-          await ctx.reply(
-            `Сумма консультации: ${PRICE_RUB} ₽.\n(QR не подключён) После оплаты нажмите «Я оплатил(а)».`,
-            { reply_markup: kb }
-          );
-        }
-        return ctx.wizard.next();
+    // если уже предложили оплату — лишние фото не триггерят повторов
+    if (S.paymentAsked) {
+      if (ctx.message?.photo?.length) {
+        await ctx.reply("Фото принял 👍 Теперь нажмите «Я оплатил(а)» и выберите время.");
+      } else {
+        await ctx.reply("После оплаты нажмите «Я оплатил(а)».");
       }
       return;
     }
 
-    await ctx.reply("Пришлите 3–5 фото высыпаний (общий план и крупные планы).");
+    // просим фото, если пришло не фото
+    if (!ctx.message?.photo?.length) {
+      await ctx.reply("Пришлите 3–5 фото высыпаний (общий план и крупные планы).");
+      return;
+    }
+
+    // добавляем фото
+    const largest = ctx.message.photo.at(-1);
+    S.photos.push(largest.file_id);
+    const albumId = ctx.message.media_group_id || null;
+
+    // счётчик
+    await ctx.reply(`Фото получено ✅ (${S.photos.length})`);
+
+    // ==== обработка альбомов ====
+    S._album = S._album || {};
+    if (albumId) {
+      if (S._album.t) clearTimeout(S._album.t);
+      S._album.id = albumId;
+
+      S._album.t = setTimeout(async () => {
+        if (S.photos.length >= 3 && !S.paymentAsked) {
+          S.paymentAsked = true;
+
+          const kb = { inline_keyboard: [[{ text: "Я оплатил(а)", callback_data: "paid_yes" }]] };
+
+          if (PAYMENT_QR_URL) {
+            await ctx.replyWithPhoto(PAYMENT_QR_URL, {
+              caption: `Отлично! Фото достаточно.\n💳 Оплата консультации: ${PRICE_RUB} ₽\nОтсканируйте QR и нажмите кнопку ниже.`,
+              reply_markup: kb
+            });
+          } else {
+            await ctx.reply(
+              `Сумма консультации: ${PRICE_RUB} ₽.\n(QR не подключён) После оплаты нажмите «Я оплатил(а)».`,
+              { reply_markup: kb }
+            );
+          }
+
+          if (ctx.wizard && ctx.wizard.cursor === 3) {
+            await ctx.wizard.next(); // шаг 4
+          }
+        }
+      }, 1200); // ждём дольёта кадров альбома
+      return;
+    }
+
+    // ==== одиночные фото (не альбом) ====
+    if (S.photos.length >= 3 && !S.paymentAsked) {
+      S.paymentAsked = true;
+
+      const kb = { inline_keyboard: [[{ text: "Я оплатил(а)", callback_data: "paid_yes" }]] };
+
+      if (PAYMENT_QR_URL) {
+        await ctx.replyWithPhoto(PAYMENT_QR_URL, {
+          caption: `Отлично! Фото достаточно.\n💳 Оплата консультации: ${PRICE_RUB} ₽\nОтсканируйте QR и нажмите кнопку ниже.`,
+          reply_markup: kb
+        });
+      } else {
+        await ctx.reply(
+          `Сумма консультации: ${PRICE_RUB} ₽.\n(QR не подключён) После оплаты нажмите «Я оплатил(а)».`,
+          { reply_markup: kb }
+        );
+      }
+
+      if (ctx.wizard && ctx.wizard.cursor === 3) {
+        await ctx.wizard.next(); // шаг 4
+      }
+      return;
+    }
   },
 
   // Шаг 4 — подтверждение оплаты → Кнопки WebApp (inline + url + текст)
@@ -226,7 +273,7 @@ bot.command("terms", (ctx) => ctx.reply(TERMS_TEXT));
 bot.command("privacy", (ctx) => ctx.reply(PRIVACY_TEXT));
 bot.command("id", (ctx) => ctx.reply(`Ваш Telegram ID: ${ctx.from.id}`));
 
-// Диагностика: проверить открытие WebApp вручную
+// Диагностика: вручную открыть WebApp
 bot.command("webapp", async (ctx) => {
   await ctx.reply(
     "Тест открытия WebApp:",
@@ -243,6 +290,7 @@ bot.command("webapp", async (ctx) => {
 });
 
 // ===== Приём данных из WebApp (/datetime) =====
+// WebApp: tg.sendData(JSON.stringify({ datetimeISO, note }))
 bot.on("message", async (ctx) => {
   const raw = ctx.message?.web_app_data?.data;
   if (!raw) return;
@@ -312,7 +360,7 @@ function nextWorkSlot(from){let d=roundToStep(from,STEP_MIN); const h=d.getHours
   return d;}
 const min=new Date(Date.now()+MIN_HOURS*3600*1000);
 const start=nextWorkSlot(min);
-const toLocal=(d)=>\`\${d.getFullYear()}-\${pad(d.getMonth()+1)}-\${pad(d.getDate())}T\${pad(d.getHours())}:\${pad(d.getMinutes())}\`;
+const toLocal=(d)=>\`\${d.getFullYear()}-\${String(d.getMonth()+1).padStart(2,'0')}-\${String(d.getDate()).padStart(2,'0')}T\${String(d.getHours()).padStart(2,'0')}:\${String(d.getMinutes()).padStart(2,'0')}\`;
 dt.min=toLocal(start); dt.value=toLocal(start);
 document.getElementById('send').onclick=()=>{
   if(!dt.value) return alert('Выберите дату и время');
@@ -345,9 +393,11 @@ app.get("/", (_req, res) => res.send("ARI bot running ✅"));
     allowedUpdates: ["message", "callback_query"]
   });
 
+  console.log("✅ Bot launched. WEBAPP_URL =", WEBAPP_URL);
   app.listen(PORT, () => console.log("✅ ARI bot + WebApp listening on", PORT));
 })();
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
+
 
