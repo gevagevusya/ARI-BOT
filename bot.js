@@ -11,7 +11,7 @@ const ADMIN_ID        = process.env.ADMIN_ID ? Number(process.env.ADMIN_ID) : un
 const ADMIN_CHANNEL   = process.env.ADMIN_CHANNEL ? Number(process.env.ADMIN_CHANNEL) : undefined;
 const PAYMENT_QR_URL  = process.env.PAYMENT_QR_URL || '';
 const CAL_BOOKING_URL = process.env.CAL_BOOKING_URL || '';
-const MEETING_URL     = process.env.MEETING_URL || 'https://telemost.yandex.ru/'; // можно заменить в ENV
+const MEETING_URL     = process.env.MEETING_URL || 'https://telemost.yandex.ru/';
 const PRICE_RUB       = 3500;
 
 if (!BOT_TOKEN) { console.error('❌ Missing BOT_TOKEN'); process.exit(1); }
@@ -79,30 +79,25 @@ function summarize(ctx){
   return parts.join('\n');
 }
 
-// ru-формат даты: «12 ноября 14:00 (Europe/Moscow)»
+// ru-формат даты
 function formatRuDate(date, tz = 'Europe/Moscow') {
   try {
     const d = new Date(date);
     const fmt = new Intl.DateTimeFormat('ru-RU', {
-      timeZone: tz,
-      day: '2-digit', month: 'long', hour: '2-digit', minute: '2-digit'
+      timeZone: tz, day: '2-digit', month: 'long', hour: '2-digit', minute: '2-digit'
     });
     return fmt.format(d);
   } catch { return null; }
 }
 
-// Парсим payload из /start confirm_...
-// Поддерживаем несколько форматов:
-// 1) confirm_2025-11-12T14:00:00+03:00
-// 2) confirm_20251112_1400
-// 3) confirm-epoch-1699780800000
+// Парсинг payload из /start confirm_...
 function parseConfirmPayload(p) {
   if (!p) return null;
   if (!/^confirm[_-]/i.test(p)) return null;
 
   const rest = decodeURIComponent(p.replace(/^confirm[_-]/i, '')).trim();
 
-  // epoch миллисекундами
+  // epoch
   if (/^epoch[-_]\d{10,}$/.test(rest)) {
     const ms = Number(rest.replace(/^epoch[-_]/, ''));
     if (Number.isFinite(ms)) return { iso: new Date(ms).toISOString(), tz: 'Europe/Moscow' };
@@ -247,14 +242,11 @@ const wizard = new WizardScene(
 );
 
 // ===== Сцены и middleware =====
-const { WizardScene: _W, Stage } = Scenes;
 const stage = new Stage([wizard]);
 bot.use(session());
 bot.use(stage.middleware());
 
 // ===== Команды =====
-
-// /start с deep-link параметром (например, /start confirm_2025-11-12T14:00:00+03:00)
 bot.start(async (ctx) => {
   const payload = (ctx.startPayload || '').trim();
 
@@ -351,3 +343,4 @@ const PORT = process.env.PORT || 3000;
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
