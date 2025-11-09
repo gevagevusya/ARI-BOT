@@ -1,222 +1,304 @@
-// index.js — ARI Telegram Bot (Node.js + Telegraf, Railway)
-// ENV: BOT_TOKEN, ADMIN_ID, SITE_URL, PAYMENT_QR_URL
+// index.js — ARI Telegram Bot (QR 3500 ₽ + Cal.com webhook + /id)
+// Поток: согласие → жалобы → анамнез заболевания → фото → QR → "Я оплатил(а)" → Cal.com (?tgid=...) → webhook подтверждает
+// ENV: BOT_TOKEN, ADMIN_ID, PAYMENT_QR_URL, CAL_BOOKING_URL, PUBLIC_BASE_URL, CAL_WEBHOOK_SECRET (опц.)
+// Node >= 20
 
 import express from 'express';
-import { Telegraf, Markup } from 'telegraf';
+import crypto from 'crypto';
+import { Telegraf, Markup, Scenes, session } from 'telegraf';
 
-// ====== ENV ======
-const BOT_TOKEN      = process.env.BOT_TOKEN;        // токен бота из @BotFather
-const ADMIN_ID_RAW   = process.env.ADMIN_ID;         // твой Telegram ID
-const ADMIN_ID       = ADMIN_ID_RAW ? Number(ADMIN_ID_RAW) : undefined;
-const SITE_URL       = process.env.SITE_URL || 'https://independent-intuition-production.up.railway.app/';
-const PAYMENT_QR_URL = process.env.PAYMENT_QR_URL || ''; // ссылка на картинку QR (может быть пусто)
+const BOT_TOKEN          = process.env.BOT_TOKEN;
+const ADMIN_ID           = process.env.ADMIN_ID ? Number(process.env.ADMIN_ID) : undefined;
+const PAYMENT_QR_URL     = process.env.PAYMENT_QR_URL || '';              // ссылка на картинку QR (3500 ₽)
+const CAL_BOOKING_URL    = process.env.CAL_BOOKING_URL || '';             // https://cal.com/yourname/derma-20
+const PUBLIC_BASE_URL    = process.env.PUBLIC_BASE_URL || '';             // https://your-railway.up.railway.app
+const CAL_WEBHOOK_SECRET = process.env.CAL_WEBHOOK_SECRET || '';          // строка-подпись вебхука (по желанию)
+const PRICE_RUB          = 3500;
 
-if (!BOT_TOKEN) {
-  console.error('❌ Missing BOT_TOKEN env');
-  process.exit(1);
-}
+if (!BOT_TOKEN) { console.error('❌ Missing BOT_TOKEN'); process.exit(1); }
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// ====== Хелперы ======
-function prettyCard(d = {}) {
-  return [
+// ===== Юридика (кратко) =====
+const LEGAL_BRIEF =
+  '⚖️ Важно:\n' +
+  '— Бот не является медицинской консультацией и не ставит диагноз.\n' +
+  '— Ответы носят информационный характер и не заменяют очный осмотр.\n' +
+  '— Данные не сохраняются вне Telegram. Внешние БД не используются.\n' +
+  '— При экстренных состояниях обращайтесь за неотложной медицинской помощью.';
+
+const TERMS_TEXT =
+  'Пользовательское соглашение (кратко)\n\n' +
+  '1) Бот предоставляет информационные ответы без постановки диагноза и назначения лечения.\n' +
+  '2) Сообщения в боте не являются телемедицинской консультацией; рекомендации — справочные.\n' +
+  '3) Сведения предоставляются добровольно в рамках Telegram; внешнего хранения нет.\n' +
+  '4) Итоговые решения принимаются после очной консультации у врача.\n' +
+  '5) При неотложных состояниях — экстренная помощь.\n\n' +
+  'Полная версия — по запросу.';
+
+const PRIVACY_TEXT =
+  'Политика конфиденциальности (кратко)\n\n' +
+  '1) Бот получает только то, что вы отправляете в чат.\n' +
+  '2) Внешнее хранение отсутствует; переписка хранится в Telegram по их правилам.\n' +
+  '3) Использование сведений — для ответа и организации консультации.\n' +
+  '4) Передача третьим лицам — только по закону.\n' +
+  '5) Не отправляйте избыточные персональные данные.';
+
+// ===== Хелперы =====
+function prettify(s){ return (s || '').trim() || '—'; }
+function summarize(ctx){
+  const d = ctx.session?.ari || {};
+  const parts = [
     '📨 Новая заявка ARI',
-    `ФИО: ${d.fio || '—'}`,
-    `Дата рождения: ${d.dob || '—'}`,
-    `Email: ${d.email || '—'}`,
-    `Жалобы: ${d.complaints || '—'}`,
-    `Анамнез заболевания: ${d.hx_disease || '—'}`,
-    `Анамнез жизни: ${d.hx_life || '—'}`,
-    `Хронические: ${d.chronic || '—'}`,
-    `Лекарства: ${d.meds || '—'}`,
-    `Аллергии: ${d.allergy || '—'}`,
-    `Ранее лечение: ${d.prev_tx || '—'}`
-  ].join('\n');
-}
-
-function makeSlots() {
-  const today = new Date();
-  const slot = (offsetDays, h, m) => {
-    const d = new Date(today);
-    d.setDate(today.getDate() + offsetDays);
-    d.setHours(h, m, 0, 0);
-    const dd = String(d.getDate()).padStart(2, '0');
-    const mm = String(d.getMonth() + 1).padStart(2, '0');
-    const hh = String(d.getHours()).padStart(2, '0');
-    const mi = String(d.getMinutes()).padStart(2, '0');
-    return { label: `${dd}.${mm} ${hh}:${mi}`, data: `slot_${d.getTime()}` };
-  };
-  return [
-    slot(0, 18, 30),
-    slot(1, 12, 0),
-    slot(1, 19, 0),
-    slot(2, 11, 30),
-    slot(2, 16, 0),
+    `Пациент: @${ctx.from?.username || '—'} (id ${ctx.from?.id})`,
+    `Жалобы: ${prettify(d.complaints)}`,
+    `Анамнез заболевания: ${prettify(d.hxDisease)}`,
   ];
+  if (d.photos?.length) parts.push(`Фото: ${d.photos.length} шт.`);
+  if (d.paid) parts.push('Оплата: подтверждена пользователем');
+  return parts.join('\n');
 }
 
-// ====== Команды ======
-bot.start(async (ctx) => {
-  await ctx.reply(
-    'Привет! Это ARI — онлайн-консультации дерматолога.\n\n' +
-    '1) Нажмите кнопку ниже и заполните короткую анкету\n' +
-    '2) Прикрепите фото высыпаний здесь, в чате\n' +
-    '3) Оплатите по QR и подтвердите оплату\n' +
-    '4) Я предложу время консультации',
-    Markup.inlineKeyboard([
-      [Markup.button.webApp('Открыть анкету', SITE_URL)]
-    ])
-  );
-});
+function extractTgIdFromCalPayload(body){
+  const meta = body?.metadata || body?.meta || {};
+  if (meta.tgid && /^\d+$/.test(String(meta.tgid))) return Number(meta.tgid);
 
+  const responses = body?.responses || body?.answers || [];
+  for (const r of responses) {
+    const label = (r?.label || r?.question || '').toString().toLowerCase();
+    const val   = (r?.value || r?.answer || '').toString().trim();
+    if ((/telegram\s*id/.test(label) || /tg(id)?|telegram_id/.test(label)) && /^\d+$/.test(val)) {
+      return Number(val);
+    }
+  }
+
+  const attendees = body?.attendees || [];
+  for (const a of attendees) {
+    const note = (a?.notes || '').toString();
+    const m = note.match(/tgid[:=]\s*(\d{4,})/i);
+    if (m) return Number(m[1]);
+  }
+
+  const urlParams = body?.urlParameters || body?.urlParams || {};
+  if (urlParams.tgid && /^\d+$/.test(String(urlParams.tgid))) return Number(urlParams.tgid);
+
+  return undefined;
+}
+
+function bookingShortInfo(body){
+  try{
+    const event = body?.eventType?.slug || body?.eventType || 'event';
+    const start = body?.startTime || body?.start?.time || body?.start_time || '';
+    const end   = body?.endTime   || body?.end?.time   || body?.end_time   || '';
+    const name  = body?.name || body?.attendees?.[0]?.name || '';
+    const email = body?.email || body?.attendees?.[0]?.email || '';
+    return `🗓 Бронь: ${event}\nИмя: ${name}\nEmail: ${email}\nВремя: ${start} → ${end}`;
+  } catch { return '🗓 Новая бронь'; }
+}
+
+// ===== Wizard-сцена =====
+const { WizardScene, Stage } = Scenes;
+
+const wizard = new WizardScene(
+  'ari',
+  // Шаг 0 — старт и согласие
+  async (ctx) => {
+    ctx.session.ari = { photos: [], paid: false };
+    await ctx.reply(
+      'Как это работает:\n' +
+      '1) Опишете жалобы и анамнез заболевания\n' +
+      '2) Пришлёте 3–5 фото высыпаний\n' +
+      `3) Оплатите консультацию по QR (${PRICE_RUB} ₽)\n` +
+      '4) Выберете удобное время в календаре\n' +
+      '5) Я свяжусь с вами для консультации\n\n' + LEGAL_BRIEF,
+      Markup.inlineKeyboard([
+        [Markup.button.callback('📄 Пользовательское соглашение', 'terms')],
+        [Markup.button.callback('🔒 Политика конфиденциальности', 'privacy')],
+        [Markup.button.callback('✅ Согласен(а) и начать', 'agree')],
+      ])
+    );
+    return ctx.wizard.next();
+  },
+
+  // Шаг 1 — жалобы
+  async (ctx) => {
+    if (ctx.updateType === 'callback_query') {
+      const cb = ctx.callbackQuery.data;
+      await ctx.answerCbQuery();
+      if (cb === 'terms')   { await ctx.reply(TERMS_TEXT); return; }
+      if (cb === 'privacy') { await ctx.reply(PRIVACY_TEXT); return; }
+      if (cb === 'agree') {
+        await ctx.reply(
+          'Опишите жалобы: что беспокоит, где локализация, когда началось, что усиливает/ослабляет.\n\n' +
+          'Пример: «2 недели зудящие пятна на шее и плечах, усиливаются вечером, частично проходят после увлажняющего крема».'
+        );
+        return ctx.wizard.next();
+      }
+      return;
+    }
+    await ctx.reply('Пожалуйста, подтвердите согласие, чтобы продолжить: «✅ Согласен(а) и начать».');
+  },
+
+  // Шаг 2 — анамнез заболевания
+  async (ctx) => {
+    if (!ctx.message?.text) { await ctx.reply('Напишите, пожалуйста, текстом.'); return; }
+    ctx.session.ari.complaints = ctx.message.text.trim();
+    await ctx.reply(
+      'Опишите анамнез заболевания: начало, динамика, что уже пробовали лечить (препараты, дозы, длительность), переносимость.'
+    );
+    return ctx.wizard.next();
+  },
+
+  // Шаг 3 — фото
+  async (ctx) => {
+    if (!ctx.session.ari.photosInit) {
+      ctx.session.ari.photosInit = true;
+      await ctx.reply(
+        'Пришлите, пожалуйста, 3–5 фото:\n' +
+        '• общий план (видна область целиком)\n' +
+        '• 2–3 крупных плана (резко, в фокусе)\n' +
+        '• хорошее освещение, без фильтров',
+        Markup.inlineKeyboard([[Markup.button.callback('📦 Фото отправлены', 'photos_done')]])
+      );
+      return;
+    }
+
+    if (ctx.message?.photo?.length) {
+      const largest = ctx.message.photo.at(-1);
+      ctx.session.ari.photos.push(largest.file_id);
+      await ctx.reply(`Фото получено ✅ (${ctx.session.ari.photos.length})`);
+      return;
+    }
+
+    if (ctx.updateType === 'callback_query' && ctx.callbackQuery.data === 'photos_done') {
+      await ctx.answerCbQuery();
+      if (PAYMENT_QR_URL) {
+        await ctx.replyWithPhoto(PAYMENT_QR_URL, {
+          caption: `Оплата консультации: ${PRICE_RUB} ₽.\nОтсканируйте QR, оплатите и нажмите кнопку ниже.`,
+          reply_markup: { inline_keyboard: [[{ text: 'Я оплатил(а)', callback_data: 'paid_yes' }]] }
+        });
+      } else {
+        await ctx.reply(
+          `Сумма консультации: ${PRICE_RUB} ₽.\nQR не подключён. После оплаты нажмите «Я оплатил(а)».`,
+          Markup.inlineKeyboard([[Markup.button.callback('Я оплатил(а)', 'paid_yes')]])
+        );
+      }
+      return ctx.wizard.next();
+    }
+
+    await ctx.reply('Пришлите фото или нажмите «Фото отправлены».');
+  },
+
+  // Шаг 4 — подтверждение оплаты → Cal.com с tgid
+  async (ctx) => {
+    if (!(ctx.updateType === 'callback_query' && ctx.callbackQuery.data === 'paid_yes')) {
+      await ctx.reply('После оплаты нажмите кнопку «Я оплатил(а)».'); return;
+    }
+    await ctx.answerCbQuery('Спасибо!');
+    ctx.session.ari.paid = true;
+
+    const chatId = ctx.chat?.id || ctx.from?.id;
+    const url = CAL_BOOKING_URL
+      ? (CAL_BOOKING_URL + (CAL_BOOKING_URL.includes('?') ? '&' : '?') + `tgid=${encodeURIComponent(chatId)}`)
+      : '';
+
+    if (url) {
+      await ctx.reply(
+        'Оплата подтверждена ✅\nВыберите удобное время (живая ссылка с актуальными слотами):',
+        Markup.inlineKeyboard([[ Markup.button.url('📅 Выбрать время', url) ]])
+      );
+      await ctx.reply('Пожалуйста, не удаляйте параметр в ссылке — он нужен для автоматического подтверждения.');
+    } else {
+      await ctx.reply('Оплата подтверждена ✅. Напишите удобные дни/время — подберу ближайшее окно.');
+    }
+
+    if (ADMIN_ID) {
+      await ctx.telegram.sendMessage(ADMIN_ID, summarize(ctx));
+      const d = ctx.session.ari;
+      if (d.photos?.length) {
+        for (const file_id of d.photos) {
+          await ctx.telegram.sendPhoto(ADMIN_ID, file_id).catch(()=>{});
+        }
+      }
+    }
+
+    await ctx.reply('Спасибо! После выбора времени пришлю подтверждение.');
+    return ctx.scene.leave();
+  }
+);
+
+// ===== Сцены и middleware =====
+const stage = new Stage([wizard]);
+bot.use(session());
+bot.use(stage.middleware());
+
+// ===== Команды =====
+bot.start(async (ctx) => { await ctx.scene.enter('ari'); });
+bot.command('terms', async (ctx) => ctx.reply(TERMS_TEXT));
+bot.command('privacy', async (ctx) => ctx.reply(PRIVACY_TEXT));
 bot.command('id', async (ctx) => {
   await ctx.reply(`Ваш Telegram ID: \`${ctx.from.id}\``, { parse_mode: 'Markdown' });
 });
 
-// Лог: видеть, что web_app_data реально приходит
-bot.on('message', (ctx, next) => {
-  if (ctx.message?.web_app_data) {
-    console.log('✅ got web_app_data from', ctx.from?.id);
-  }
-  return next();
-});
-
-// ====== Правильный обработчик WebApp-данных ======
-bot.on('message', async (ctx) => {
-  if (!ctx.message?.web_app_data) return;
-
-  try {
-    const raw = ctx.message.web_app_data.data;
-    const payload = JSON.parse(raw || '{}');
-
-    if (payload?.type !== 'ari_request') {
-      return ctx.reply('Получен неизвестный формат данных.');
-    }
-
-    const d = payload.data || {};
-
-    // Сообщение пациенту
-    await ctx.reply(
-      'Спасибо! Заявка получена ✅\n' +
-      'Пожалуйста, прикрепите сюда 3–5 фото высыпаний (хорошее освещение, фокус, общий план + крупный план).'
-    );
-
-    // Уведомление врачу
-    if (ADMIN_ID) {
-      await ctx.telegram.sendMessage(
-        ADMIN_ID,
-        `👤 От: @${ctx.from.username || '—'} (id ${ctx.from.id})\n${prettyCard(d)}`
-      );
-    }
-
-    // QR или кнопка «Я оплатил(а)»
-    if (PAYMENT_QR_URL) {
-      await ctx.replyWithPhoto(PAYMENT_QR_URL, {
-        caption: 'Оплата консультации: отсканируйте QR код. После оплаты нажмите кнопку ниже.',
-        reply_markup: {
-          inline_keyboard: [[{ text: 'Я оплатил(а)', callback_data: 'paid_yes' }]]
-        }
-      });
-    } else {
-      await ctx.reply(
-        'Ссылка/QR для оплаты будет подключена. После оплаты нажмите «Я оплатил(а)».',
-        { reply_markup: { inline_keyboard: [[{ text: 'Я оплатил(а)', callback_data: 'paid_yes' }]] } }
-      );
-    }
-
-  } catch (e) {
-    console.error('[web_app_data] parse error', e);
-    await ctx.reply('Произошла ошибка при обработке заявки. Напишите, пожалуйста, данные вручную.');
-  }
-});
-
-// ====== Приём фото ======
-bot.on('photo', async (ctx) => {
-  await ctx.reply('Фото получено ✅ Пришлите ещё 2–4 фото при необходимости, затем нажмите «Я оплатил(а)».');
-
-  if (ADMIN_ID) {
-    try {
-      const largest = ctx.message.photo[ctx.message.photo.length - 1];
-      await ctx.telegram.sendPhoto(ADMIN_ID, largest.file_id, {
-        caption: `📷 Фото от @${ctx.from.username || '—'} (id ${ctx.from.id})`
-      });
-    } catch (e) {
-      console.error('Forward photo error:', e);
-    }
-  }
-});
-
-// ====== Подтверждение оплаты → выбор слотов ======
-bot.action('paid_yes', async (ctx) => {
-  await ctx.answerCbQuery();
-
-  // Попробуем обновить подпись к фото с QR (если была)
-  await ctx.editMessageCaption?.({
-    caption: 'Оплата подтверждена ✅',
-    reply_markup: { inline_keyboard: [] }
-  }).catch(() => { /* если не фото — игнорируем */ });
-
-  const slots = makeSlots();
-  await ctx.reply(
-    'Спасибо! Выберите удобное время (предварительно):',
-    {
-      reply_markup: {
-        inline_keyboard: [
-          ...slots.map(s => [{ text: s.label, callback_data: s.data }]),
-          [{ text: 'Другое время', callback_data: 'slot_other' }]
-        ]
-      }
-    }
-  );
-
-  if (ADMIN_ID) {
-    await ctx.telegram.sendMessage(ADMIN_ID, `💳 @${ctx.from.username || '—'} подтвердил(а) оплату. ID: ${ctx.from.id}`);
-  }
-});
-
-bot.action(/slot_\d+/, async (ctx) => {
-  await ctx.answerCbQuery();
-  const when = new Date(Number(ctx.match[0].split('_')[1]));
-  const dd = String(when.getDate()).padStart(2, '0');
-  const mm = String(when.getMonth() + 1).padStart(2, '0');
-  const hh = String(when.getHours()).padStart(2, '0');
-  const mi = String(when.getMinutes()).padStart(2, '0');
-
-  await ctx.editMessageText(`Предварительно выбрано: ${dd}.${mm} ${hh}:${mi}. Я свяжусь с вами для подтверждения.`);
-
-  if (ADMIN_ID) {
-    await ctx.telegram.sendMessage(ADMIN_ID, `🗓 Пациент @${ctx.from.username || '—'} выбрал слот ${dd}.${mm} ${hh}:${mi}`);
-  }
-});
-
-bot.action('slot_other', async (ctx) => {
-  await ctx.answerCbQuery();
-  await ctx.editMessageText('Напишите, пожалуйста, удобные для вас дни и время — я подберу ближайшее доступное окно.');
-  if (ADMIN_ID) {
-    await ctx.telegram.sendMessage(ADMIN_ID, `🗓 Пациент @${ctx.from.username || '—'} попросил другое время.`);
-  }
-});
-
-// ====== Старт бота: удаляем webhook и запускаем polling ======
-(async () => {
-  try {
-    await bot.telegram.deleteWebhook({ drop_pending_updates: false });
-    console.log('🔧 Webhook deleted (switching to polling)');
-  } catch (e) {
-    console.warn('Webhook delete warning:', e.message);
-  }
-
-  await bot.launch();
-  console.log('✅ ARI bot started');
-})();
-
-// Graceful shutdown
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
-// ====== Мини-Express сервер для health-check на Railway ======
+// ===== Express / health-check =====
 const app = express();
 app.get('/', (_req, res) => res.send('ARI bot is running'));
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Health server on', PORT));
+
+// ----- Cal.com webhook (RAW body для подписи) -----
+app.post('/cal/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  try {
+    const raw = req.body;
+    const textBody = raw?.toString('utf8') || '{}';
+    const data = JSON.parse(textBody);
+
+    if (CAL_WEBHOOK_SECRET) {
+      const sig = req.header('x-cal-signature') || req.header('x-cal-signature-256') || req.header('x-webhook-signature') || '';
+      const hmac = crypto.createHmac('sha256', CAL_WEBHOOK_SECRET).update(textBody).digest('hex');
+      if (!sig || sig.replace(/^sha256=/,'') !== hmac) {
+        console.warn('⚠️ Cal webhook bad signature');
+        return res.status(400).send('bad signature');
+      }
+    }
+
+    const event = (data?.triggerEvent || data?.event || '').toString().toUpperCase();
+    if (!event || !/BOOKING/i.test(event)) return res.send('OK');
+
+    const tgId = extractTgIdFromCalPayload(data) || 0;
+    const short = bookingShortInfo(data);
+
+    if (ADMIN_ID) {
+      try { await bot.telegram.sendMessage(ADMIN_ID, `📥 Cal.com webhook\n${short}\nTGID: ${tgId || 'не найден'}`); } catch {}
+    }
+
+    if (tgId) {
+      try {
+        await bot.telegram.sendMessage(
+          tgId,
+          'Запись получена ✅\nСпасибо! Я пришлю ссылку на телемост и уточню детали перед консультацией.'
+        );
+      } catch (e) { console.error('send to patient failed:', e.message); }
+    }
+
+    res.send('OK');
+  } catch (e) {
+    console.error('Cal webhook error:', e);
+    res.status(500).send('error');
+  }
+});
+
+// ===== Запуск =====
+(async () => {
+  try {
+    await bot.telegram.deleteWebhook({ drop_pending_updates: false });
+    console.log('🔧 TG webhook deleted (switch to polling)');
+  } catch (e) {
+    console.warn('TG webhook delete warn:', e.message);
+  }
+  await bot.launch();
+  console.log('✅ ARI bot started');
+  app.listen(PORT, () => console.log('Health server on', PORT));
+})();
+
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
