@@ -1,25 +1,26 @@
-// index.js — ARI Telegram Bot (QR 3500 ₽ + Cal.com webhook + /id)
+// index.js — ARI Telegram Bot (QR 3500 ₽ + Cal.com webhook + /id + fallback)
 // Поток: согласие → жалобы → анамнез заболевания → фото → QR → "Я оплатил(а)" → Cal.com (?tgid=...) → webhook подтверждает
 // ENV: BOT_TOKEN, ADMIN_ID, PAYMENT_QR_URL, CAL_BOOKING_URL, PUBLIC_BASE_URL, CAL_WEBHOOK_SECRET (опц.)
-// Node >= 20
+// Требования: Node >= 20, зависимости: telegraf, express
 
 import express from 'express';
 import crypto from 'crypto';
 import { Telegraf, Markup, Scenes, session } from 'telegraf';
 
+// ===== ENV =====
 const BOT_TOKEN          = process.env.BOT_TOKEN;
 const ADMIN_ID           = process.env.ADMIN_ID ? Number(process.env.ADMIN_ID) : undefined;
-const PAYMENT_QR_URL     = process.env.PAYMENT_QR_URL || '';              // ссылка на картинку QR (3500 ₽)
-const CAL_BOOKING_URL    = process.env.CAL_BOOKING_URL || '';             // https://cal.com/yourname/derma-20
-const PUBLIC_BASE_URL    = process.env.PUBLIC_BASE_URL || '';             // https://your-railway.up.railway.app
-const CAL_WEBHOOK_SECRET = process.env.CAL_WEBHOOK_SECRET || '';          // строка-подпись вебхука (по желанию)
+const PAYMENT_QR_URL     = process.env.PAYMENT_QR_URL || '';            // URL картинки QR для оплаты
+const CAL_BOOKING_URL    = process.env.CAL_BOOKING_URL || '';           // https://cal.com/yourname/event
+const PUBLIC_BASE_URL    = process.env.PUBLIC_BASE_URL || '';           // https://<bot>.up.railway.app
+const CAL_WEBHOOK_SECRET = process.env.CAL_WEBHOOK_SECRET || '';        // строка для подписи (можно пусто на отладке)
 const PRICE_RUB          = 3500;
 
 if (!BOT_TOKEN) { console.error('❌ Missing BOT_TOKEN'); process.exit(1); }
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// ===== Юридика (кратко) =====
+// ===== Юридический блок =====
 const LEGAL_BRIEF =
   '⚖️ Важно:\n' +
   '— Бот не является медицинской консультацией и не ставит диагноз.\n' +
@@ -29,18 +30,18 @@ const LEGAL_BRIEF =
 
 const TERMS_TEXT =
   'Пользовательское соглашение (кратко)\n\n' +
-  '1) Бот предоставляет информационные ответы без постановки диагноза и назначения лечения.\n' +
-  '2) Сообщения в боте не являются телемедицинской консультацией; рекомендации — справочные.\n' +
+  '1) Бот даёт информационные ответы без постановки диагноза и назначения лечения.\n' +
+  '2) Сообщения в боте не являются телемедицинской консультацией.\n' +
   '3) Сведения предоставляются добровольно в рамках Telegram; внешнего хранения нет.\n' +
-  '4) Итоговые решения принимаются после очной консультации у врача.\n' +
+  '4) Итоговые решения — после очной консультации у врача.\n' +
   '5) При неотложных состояниях — экстренная помощь.\n\n' +
   'Полная версия — по запросу.';
 
 const PRIVACY_TEXT =
   'Политика конфиденциальности (кратко)\n\n' +
-  '1) Бот получает только то, что вы отправляете в чат.\n' +
-  '2) Внешнее хранение отсутствует; переписка хранится в Telegram по их правилам.\n' +
-  '3) Использование сведений — для ответа и организации консультации.\n' +
+  '1) Получаем только то, что вы отправляете в чат.\n' +
+  '2) Внешних баз данных нет; переписка хранится по правилам Telegram.\n' +
+  '3) Используем сведения для ответа и организации консультации.\n' +
   '4) Передача третьим лицам — только по закону.\n' +
   '5) Не отправляйте избыточные персональные данные.';
 
@@ -63,11 +64,11 @@ function extractTgIdFromCalPayload(body){
   const meta = body?.metadata || body?.meta || {};
   if (meta.tgid && /^\d+$/.test(String(meta.tgid))) return Number(meta.tgid);
 
-  const responses = body?.responses || body?.answers || [];
+  const responses = body?.responses || body?.answers || body?.questionsAndAnswers || [];
   for (const r of responses) {
     const label = (r?.label || r?.question || '').toString().toLowerCase();
     const val   = (r?.value || r?.answer || '').toString().trim();
-    if ((/telegram\s*id/.test(label) || /tg(id)?|telegram_id/.test(label)) && /^\d+$/.test(val)) {
+    if ((/telegram\s*id/.test(label) || /tgid|telegram_id/.test(label)) && /^\d+$/.test(val)) {
       return Number(val);
     }
   }
@@ -96,7 +97,7 @@ function bookingShortInfo(body){
   } catch { return '🗓 Новая бронь'; }
 }
 
-// ===== Wizard-сцена =====
+// ===== Сцены =====
 const { WizardScene, Stage } = Scenes;
 
 const wizard = new WizardScene(
@@ -136,16 +137,14 @@ const wizard = new WizardScene(
       }
       return;
     }
-    await ctx.reply('Пожалуйста, подтвердите согласие, чтобы продолжить: «✅ Согласен(а) и начать».');
+    await ctx.reply('Пожалуйста, подтвердите согласие: «✅ Согласен(а) и начать».');
   },
 
   // Шаг 2 — анамнез заболевания
   async (ctx) => {
     if (!ctx.message?.text) { await ctx.reply('Напишите, пожалуйста, текстом.'); return; }
     ctx.session.ari.complaints = ctx.message.text.trim();
-    await ctx.reply(
-      'Опишите анамнез заболевания: начало, динамика, что уже пробовали лечить (препараты, дозы, длительность), переносимость.'
-    );
+    await ctx.reply('Опишите анамнез заболевания: начало, динамика, что уже пробовали лечить (препараты, дозы, длительность), переносимость.');
     return ctx.wizard.next();
   },
 
@@ -189,7 +188,7 @@ const wizard = new WizardScene(
     await ctx.reply('Пришлите фото или нажмите «Фото отправлены».');
   },
 
-  // Шаг 4 — подтверждение оплаты → Cal.com с tgid
+  // Шаг 4 — подтверждение оплаты → Cal.com + fallback
   async (ctx) => {
     if (!(ctx.updateType === 'callback_query' && ctx.callbackQuery.data === 'paid_yes')) {
       await ctx.reply('После оплаты нажмите кнопку «Я оплатил(а)».'); return;
@@ -207,7 +206,10 @@ const wizard = new WizardScene(
         'Оплата подтверждена ✅\nВыберите удобное время (живая ссылка с актуальными слотами):',
         Markup.inlineKeyboard([[ Markup.button.url('📅 Выбрать время', url) ]])
       );
-      await ctx.reply('Пожалуйста, не удаляйте параметр в ссылке — он нужен для автоматического подтверждения.');
+      await ctx.reply(
+        'Когда завершите запись в календаре, вернитесь сюда и нажмите кнопку ниже:',
+        Markup.inlineKeyboard([[Markup.button.callback('Я забронировал(а)', 'booked_yes')]])
+      );
     } else {
       await ctx.reply('Оплата подтверждена ✅. Напишите удобные дни/время — подберу ближайшее окно.');
     }
@@ -240,54 +242,98 @@ bot.command('id', async (ctx) => {
   await ctx.reply(`Ваш Telegram ID: \`${ctx.from.id}\``, { parse_mode: 'Markdown' });
 });
 
+// Fallback на случай, если вебхук Cal.com не дошёл
+bot.action('booked_yes', async (ctx) => {
+  await ctx.answerCbQuery('Спасибо!');
+  await ctx.reply('Запись отмечена ✅. Я пришлю ссылку на телемост и уточню детали перед консультацией.');
+  if (ADMIN_ID) {
+    try {
+      await ctx.telegram.sendMessage(
+        ADMIN_ID,
+        `Пациент @${ctx.from.username || '—'} (id ${ctx.from.id}) отметил, что бронь выполнена.`
+      );
+      const d = ctx.session?.ari || {};
+      if (d?.photos?.length) {
+        for (const file_id of d.photos) {
+          await ctx.telegram.sendPhoto(ADMIN_ID, file_id).catch(()=>{});
+        }
+      }
+    } catch {}
+  }
+});
+
 // ===== Express / health-check =====
 const app = express();
 app.get('/', (_req, res) => res.send('ARI bot is running'));
-const PORT = process.env.PORT || 3000;
 
-// ----- Cal.com webhook (RAW body для подписи) -----
-app.post('/cal/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+// Пинг-страница для Cal.com
+app.get('/cal/webhook', (_req, res) => res.status(200).send('Cal webhook endpoint is alive'));
+
+// Основной вебхук Cal.com — принимаем ЛЮБОЙ content-type, отвечаем мгновенно
+app.post('/cal/webhook', express.raw({ type: () => true, limit: '2mb' }), async (req, res) => {
   try {
-    const raw = req.body;
-    const textBody = raw?.toString('utf8') || '{}';
-    const data = JSON.parse(textBody);
+    const buf = req.body || Buffer.from('{}');
+    const textBody = Buffer.isBuffer(buf) ? buf.toString('utf8') : String(buf || '{}');
 
+    // Если Cal.com шлёт пустой ping — просто 200
+    if (!textBody || textBody.trim() === '') return res.status(200).send('OK');
+
+    // Проверка подписи (можно оставить пустым CAL_WEBHOOK_SECRET на отладке)
     if (CAL_WEBHOOK_SECRET) {
-      const sig = req.header('x-cal-signature') || req.header('x-cal-signature-256') || req.header('x-webhook-signature') || '';
-      const hmac = crypto.createHmac('sha256', CAL_WEBHOOK_SECRET).update(textBody).digest('hex');
-      if (!sig || sig.replace(/^sha256=/,'') !== hmac) {
+      const sigHeader =
+        req.header('x-cal-signature') ||
+        req.header('x-cal-signature-256') ||
+        req.header('x-webhook-signature') ||
+        req.header('cal-signature') || '';
+      const expected = crypto.createHmac('sha256', CAL_WEBHOOK_SECRET).update(textBody).digest('hex');
+      const presented = sigHeader.replace(/^sha256=/,'').trim();
+      if (!presented || presented !== expected) {
         console.warn('⚠️ Cal webhook bad signature');
         return res.status(400).send('bad signature');
       }
+    } else {
+      console.warn('⚠️ CAL_WEBHOOK_SECRET empty — signature check disabled (debug)');
     }
 
-    const event = (data?.triggerEvent || data?.event || '').toString().toUpperCase();
-    if (!event || !/BOOKING/i.test(event)) return res.send('OK');
+    let data; try { data = JSON.parse(textBody); } catch { data = {}; }
 
-    const tgId = extractTgIdFromCalPayload(data) || 0;
+    // Сразу отвечаем 200, чтобы не было 502 из-за таймаута
+    res.status(200).send('OK');
+
+    const event = (data?.triggerEvent || data?.event || '').toString().toUpperCase();
+    if (!event || !/BOOKING|SCHEDULED|CREATED|CONFIRMED/.test(event)) return;
+
+    let tgId = extractTgIdFromCalPayload(data);
+    // Доп. попытка: часто кладут id в questionsAndAnswers
+    if (!tgId) {
+      const q = data?.questionsAndAnswers || [];
+      for (const qa of q) {
+        const lbl = String(qa?.question || qa?.label || '').toLowerCase();
+        const val = String(qa?.answer || qa?.value || '').trim();
+        if ((/telegram\s*id|tgid|telegram_id/.test(lbl)) && /^\d+$/.test(val)) { tgId = Number(val); break; }
+      }
+    }
+
     const short = bookingShortInfo(data);
 
     if (ADMIN_ID) {
-      try { await bot.telegram.sendMessage(ADMIN_ID, `📥 Cal.com webhook\n${short}\nTGID: ${tgId || 'не найден'}`); } catch {}
+      await bot.telegram.sendMessage(ADMIN_ID, `📥 Cal.com webhook\n${short}\nTGID: ${tgId || 'не найден'}`).catch(()=>{});
     }
 
     if (tgId) {
-      try {
-        await bot.telegram.sendMessage(
-          tgId,
-          'Запись получена ✅\nСпасибо! Я пришлю ссылку на телемост и уточню детали перед консультацией.'
-        );
-      } catch (e) { console.error('send to patient failed:', e.message); }
+      await bot.telegram.sendMessage(
+        tgId,
+        'Запись получена ✅\nСпасибо! Я пришлю ссылку на телемост и уточню детали перед консультацией.'
+      ).catch((e)=>console.error('send to patient failed:', e.message));
     }
-
-    res.send('OK');
   } catch (e) {
     console.error('Cal webhook error:', e);
-    res.status(500).send('error');
+    if (!res.headersSent) res.status(500).send('error');
   }
 });
 
 // ===== Запуск =====
+const PORT = process.env.PORT || 3000;
 (async () => {
   try {
     await bot.telegram.deleteWebhook({ drop_pending_updates: false });
@@ -302,3 +348,4 @@ app.post('/cal/webhook', express.raw({ type: 'application/json' }), async (req, 
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
