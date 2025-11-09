@@ -12,12 +12,17 @@ dayjs.extend(utc);
 
 // ===== ENV =====
 const BOT_TOKEN      = process.env.BOT_TOKEN;
-const ADMIN_CHAT_ID  = process.env.ADMIN_CHAT_ID;                // -100... (канал/группа, бот должен быть админом)
-const PAYMENT_QR_URL = process.env.PAYMENT_QR_URL || "";         // URL картинки QR на оплату
-const WEBAPP_URL     = process.env.WEBAPP_URL || "";             // https://<railway>/datetime
-const PRICE_RUB      = Number(process.env.PRICE_RUB || 3500);    // стоимость консультации
+const ADMIN_CHAT_ID  = process.env.ADMIN_CHAT_ID;                // -100... (канал/группа, бот — админ)
+const PAYMENT_QR_URL = process.env.PAYMENT_QR_URL || "";         // URL картинки QR
+const RAW_WEBAPP     = process.env.WEBAPP_URL || "";             // может быть с /datetime или без
+const PRICE_RUB      = Number(process.env.PRICE_RUB || 3500);
 const TZ             = process.env.TZ || "Europe/Berlin";
 const PORT           = process.env.PORT || 3000;
+
+// нормализуем URL: если забыли /datetime — добавим
+const WEBAPP_URL = RAW_WEBAPP.endsWith("/datetime")
+  ? RAW_WEBAPP
+  : RAW_WEBAPP.replace(/\/+$/, "") + "/datetime";
 
 if (!BOT_TOKEN)      { console.error("❌ Missing BOT_TOKEN");      process.exit(1); }
 if (!ADMIN_CHAT_ID)  { console.error("❌ Missing ADMIN_CHAT_ID");  process.exit(1); }
@@ -28,28 +33,25 @@ const bot = new Telegraf(BOT_TOKEN);
 async function sendToAdmins(telegram, payload, photos = []) {
   const tasks = [];
 
-  // текст — отдельным сообщением
   tasks.push(
     telegram.sendMessage(ADMIN_CHAT_ID, payload, { disable_web_page_preview: true }).catch(() => {})
   );
 
-  // фото — медиагруппой (до 10) или одним фото
   if (photos.length > 1) {
     const media = photos.slice(0, 10).map((fileId, i) => ({
       type: "photo",
       media: fileId,
       ...(i === 0 ? { caption: "Фото по заявке" } : {})
     }));
-    tasks.push(bot.telegram.sendMediaGroup(ADMIN_CHAT_ID, media).catch(() => {}));
+    tasks.push(telegram.sendMediaGroup(ADMIN_CHAT_ID, media).catch(() => {}));
   } else if (photos.length === 1) {
-    tasks.push(bot.telegram.sendPhoto(ADMIN_CHAT_ID, photos[0], { caption: "Фото по заявке" }).catch(() => {}));
+    tasks.push(telegram.sendPhoto(ADMIN_CHAT_ID, photos[0], { caption: "Фото по заявке" }).catch(() => {}));
   }
 
-  // выполняем в фоне
   Promise.allSettled(tasks);
 }
 
-// ===== Тексты (юридика кратко) =====
+// ===== Тексты =====
 const LEGAL_BRIEF =
   "⚖️ Важно:\n" +
   "— Бот не является медицинской консультацией и не ставит диагноз.\n" +
@@ -97,7 +99,7 @@ const wizard = new WizardScene(
   "ari",
   // Шаг 0 — приветствие и согласие
   async (ctx) => {
-    ctx.session.ari = { photos: [], paid: false, slot: null, note: "" };
+    ctx.session.ari = { photos: [], paid: false, slot: null, note: "", paymentAsked: false };
     await ctx.reply(
       "Как это работает:\n" +
       "1) Опишете жалобы и анамнез заболевания\n" +
@@ -139,33 +141,44 @@ const wizard = new WizardScene(
     return ctx.wizard.next();
   },
 
-  // Шаг 3 — фото (автопереход на оплату после ≥3 фото)
+  // Шаг 3 — фото (⚠️ фиксация: не спамим оплатой)
   async (ctx) => {
+    // если уже показывали оплату — игнорим лишние фото на этом шаге
+    if (ctx.session?.ari?.paymentAsked) return;
+
     if (ctx.message?.photo?.length) {
       const largest = ctx.message.photo.at(-1);
       ctx.session.ari.photos.push(largest.file_id);
       await ctx.reply(`Фото получено ✅ (${ctx.session.ari.photos.length})`);
 
-      if (ctx.session.ari.photos.length >= 3) {
+      if (ctx.session.ari.photos.length >= 3 && !ctx.session.ari.paymentAsked) {
+        // ставим флаг ДО отправки кнопок, чтобы исключить повторы при «залповой» отправке фото
+        ctx.session.ari.paymentAsked = true;
+
+        const kb = {
+          inline_keyboard: [[{ text: "Я оплатил(а)", callback_data: "paid_yes" }]]
+        };
+
         if (PAYMENT_QR_URL) {
           await ctx.replyWithPhoto(PAYMENT_QR_URL, {
             caption: `Отлично! Фото достаточно.\n💳 Оплата консультации: ${PRICE_RUB} ₽\nОтсканируйте QR и нажмите кнопку ниже.`,
-            reply_markup: { inline_keyboard: [[{ text: "Я оплатил(а)", callback_data: "paid_yes" }]] }
+            reply_markup: kb
           });
         } else {
           await ctx.reply(
             `Сумма консультации: ${PRICE_RUB} ₽.\n(QR не подключён) После оплаты нажмите «Я оплатил(а)».`,
-            Markup.inlineKeyboard([[Markup.button.callback("Я оплатил(а)", "paid_yes")]])
+            { reply_markup: kb }
           );
         }
         return ctx.wizard.next();
       }
-      return; // ждём ещё фото
+      return;
     }
+
     await ctx.reply("Пришлите 3–5 фото высыпаний (общий план и крупные планы).");
   },
 
-  // Шаг 4 — подтверждение оплаты → Кнопка WebApp
+  // Шаг 4 — подтверждение оплаты → Кнопки WebApp (inline + url + текст)
   async (ctx) => {
     if (!(ctx.updateType === "callback_query" && ctx.callbackQuery.data === "paid_yes")) {
       await ctx.reply("После оплаты нажмите кнопку «Я оплатил(а)»."); return;
@@ -173,63 +186,80 @@ const wizard = new WizardScene(
     await ctx.answerCbQuery("Спасибо!");
     ctx.session.ari.paid = true;
 
-    if (WEBAPP_URL) {
+    if (!WEBAPP_URL || !/^https?:\/\/.+/.test(WEBAPP_URL)) {
+      await ctx.reply(
+        "✅ Оплата подтверждена, но ссылка на форму выбора времени не настроена.\n" +
+        "Сообщите, пожалуйста, удобные дату и время текстом.\n\n" +
+        "Администратору: проверьте переменную Railway `WEBAPP_URL`."
+      );
+    } else {
       await ctx.reply(
         "✅ Оплата подтверждена\nТеперь выберите дату и время консультации:",
         {
           reply_markup: {
-            keyboard: [[{ text: "🗓 Открыть форму", web_app: { url: WEBAPP_URL } }]],
-            resize_keyboard: true,
-            one_time_keyboard: true
-          }
+            inline_keyboard: [
+              [{ text: "🗓 Открыть форму (WebApp)", web_app: { url: WEBAPP_URL } }],
+              [{ text: "Открыть в браузере", url: WEBAPP_URL }]
+            ]
+          },
+          disable_web_page_preview: true
         }
       );
-    } else {
-      await ctx.reply("✅ Оплата подтверждена. Напишите удобные дни/время текстом — подберу ближайшее окно.");
+      await ctx.reply(`Если кнопка не открывается, прямая ссылка: ${WEBAPP_URL}`);
     }
 
-    // уведомляем канал о факте оплаты и ранее собранных данных — НЕ блокируем ответ пациенту
-    sendToAdmins(ctx.telegram, summarize(ctx), ctx.session.ari.photos || []);
+    // уведомляем канал — неблокирующе
+    sendToAdmins(bot.telegram, summarize(ctx), ctx.session.ari.photos || []);
 
     return ctx.scene.leave();
   }
 );
 
-// ===== Инициализация сцен и middleware =====
+// ===== Сцены =====
 const stage = new Stage([wizard]);
 bot.use(session());
 bot.use(stage.middleware());
 
 // ===== Команды =====
-bot.start(async (ctx) => {
-  await ctx.scene.enter("ari");
-});
+bot.start(async (ctx) => { await ctx.scene.enter("ari"); });
 bot.command("terms", (ctx) => ctx.reply(TERMS_TEXT));
 bot.command("privacy", (ctx) => ctx.reply(PRIVACY_TEXT));
 bot.command("id", (ctx) => ctx.reply(`Ваш Telegram ID: ${ctx.from.id}`));
 
+// Диагностика: проверить открытие WebApp вручную
+bot.command("webapp", async (ctx) => {
+  await ctx.reply(
+    "Тест открытия WebApp:",
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "🗓 Открыть форму (WebApp)", web_app: { url: WEBAPP_URL } }],
+          [{ text: "Открыть в браузере", url: WEBAPP_URL }]
+        ]
+      }
+    }
+  );
+  await ctx.reply(`Прямая ссылка: ${WEBAPP_URL}`);
+});
+
 // ===== Приём данных из WebApp (/datetime) =====
-// tg.sendData(JSON.stringify({ datetimeISO, note }))
 bot.on("message", async (ctx) => {
   const raw = ctx.message?.web_app_data?.data;
-  if (!raw) return; // не мешаем обычной переписке
+  if (!raw) return;
 
   try {
     const { datetimeISO, note } = JSON.parse(raw || "{}");
     const utcISO = dayjs(datetimeISO).utc().format("YYYY-MM-DD HH:mm");
 
-    // сохраняем в сессию
     ctx.session.ari = ctx.session.ari || { photos: [] };
     ctx.session.ari.slot = datetimeISO;
     ctx.session.ari.note = note || "";
 
-    // мгновенный ответ пациенту
     await ctx.reply(
       `🕒 Запрос на слот получен!\nДата и время: *${datetimeISO}* (${TZ})\nМы подтвердим встречу в ближайшее время.`,
       { parse_mode: "Markdown" }
     );
 
-    // карточка в канал (в фоне)
     const card = [
       "📬 *Новая запись на консультацию*",
       `Пациент: @${ctx.from?.username || ctx.from?.id}`,
@@ -239,7 +269,7 @@ bot.on("message", async (ctx) => {
       `💬 Chat ID: \`${ctx.chat.id}\``
     ].join("\n");
 
-    sendToAdmins(ctx.telegram, card, ctx.session.ari.photos || []);
+    sendToAdmins(bot.telegram, card, ctx.session.ari.photos || []);
   } catch (e) {
     console.error(e);
     await ctx.reply("Упс, техническая ошибка. Попробуйте ещё раз.");
@@ -251,13 +281,55 @@ const app = express();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 
-// раздача статики (+ возможные будущие css/js), кешируем
+// раздача статики (если позже добавишь css/js)
 app.use(express.static(__dirname, { maxAge: "1h", etag: true }));
 
-// мини-страница Telegram WebApp
+// Вшитая резервная версия datetime.html (если файла нет — всё равно откроется)
+const DATETIME_HTML = `<!doctype html><html lang="ru"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<title>Выбор даты и времени</title>
+<style>
+body{font-family:system-ui,-apple-system,Arial;margin:20px;color:#222}
+label{display:block;margin:12px 0 6px;font-weight:500}
+input,textarea,button{width:100%;font-size:16px;padding:10px;box-sizing:border-box;border-radius:10px;border:1px solid #ccc}
+button{background:#64C27B;color:#fff;border:none;margin-top:14px;padding:12px;border-radius:10px;font-weight:600}
+</style></head><body>
+<h3>Выберите дату и время консультации</h3>
+<label>Дата и время</label>
+<input id="dt" type="datetime-local">
+<label>Комментарий (необязательно)</label>
+<textarea id="note" rows="3" placeholder="Например: утром до 12 или после 18:00"></textarea>
+<button id="send">Отправить</button>
+<script>
+const tg=window.Telegram.WebApp; tg.expand();
+const WORK_START=9, WORK_END=19, STEP_MIN=30, MIN_HOURS=2;
+const dt=document.getElementById('dt'); const pad=n=>String(n).padStart(2,'0');
+function roundToStep(date, stepMin){const d=new Date(date); const m=d.getMinutes(); const r=Math.ceil(m/stepMin)*stepMin; d.setMinutes(r,0,0); return d;}
+function nextWorkSlot(from){let d=roundToStep(from,STEP_MIN); const h=d.getHours();
+  if(h<WORK_START){d.setHours(WORK_START,0,0,0);}
+  if(h>=WORK_END){d.setDate(d.getDate()+1); d.setHours(WORK_START,0,0,0);}
+  return d;}
+const min=new Date(Date.now()+MIN_HOURS*3600*1000);
+const start=nextWorkSlot(min);
+const toLocal=(d)=>\`\${d.getFullYear()}-\${pad(d.getMonth()+1)}-\${pad(d.getDate())}T\${pad(d.getHours())}:\${pad(d.getMinutes())}\`;
+dt.min=toLocal(start); dt.value=toLocal(start);
+document.getElementById('send').onclick=()=>{
+  if(!dt.value) return alert('Выберите дату и время');
+  const chosen=new Date(dt.value); const h=chosen.getHours();
+  if(h<WORK_START||h>=WORK_END) return alert('Вне рабочих часов (09:00–19:00)');
+  if(chosen<start) return alert('Выберите время не раньше чем через 2 часа');
+  const payload={ datetimeISO: dt.value, note: document.getElementById('note').value||'' };
+  tg.sendData(JSON.stringify(payload)); tg.close();
+};
+</script></body></html>`;
+
+// если лежит реальный файл — отдадим его; иначе — встроенную копию
 app.get("/datetime", (_req, res) => {
-  res.set("Cache-Control", "public, max-age=300");
-  res.sendFile(path.join(__dirname, "datetime.html"));
+  const fsPath = path.join(__dirname, "datetime.html");
+  res.sendFile(fsPath, (err) => {
+    if (err) res.type("html").send(DATETIME_HTML);
+  });
 });
 
 // health
@@ -265,11 +337,8 @@ app.get("/", (_req, res) => res.send("ARI bot running ✅"));
 
 // ===== Запуск: чистим вебхук, отрезаем хвост, ограничиваем апдейты =====
 (async () => {
-  try {
-    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
-  } catch (e) {
-    console.warn("Webhook delete warn:", e.message);
-  }
+  try { await bot.telegram.deleteWebhook({ drop_pending_updates: true }); }
+  catch (e) { console.warn("Webhook delete warn:", e.message); }
 
   await bot.launch({
     dropPendingUpdates: true,
@@ -281,3 +350,4 @@ app.get("/", (_req, res) => res.send("ARI bot running ✅"));
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
+
