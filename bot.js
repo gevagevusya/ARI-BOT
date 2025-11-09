@@ -1,21 +1,43 @@
-// index.js — ARI Telegram Bot (QR 3500 ₽ + Cal.com redirect + /id + fallback)
+// index.js — ARI Telegram Bot (QR 3500 ₽ + Cal.com redirect + /id + fallback + admin channel)
 // Поток: согласие → жалобы → анамнез заболевания → фото → QR → "Я оплатил(а)" → Cal.com (?tgid=...) → redirect в бота (/start booked)
-// ENV: BOT_TOKEN, ADMIN_ID, PAYMENT_QR_URL, CAL_BOOKING_URL
-// Требования: Node >= 20, зависимости: telegraf, express
+// ENV: BOT_TOKEN, ADMIN_ID (опц), ADMIN_CHANNEL (опц), PAYMENT_QR_URL, CAL_BOOKING_URL
+// Требования: Node >= 20; deps: telegraf, express
 
 import express from 'express';
 import { Telegraf, Markup, Scenes, session } from 'telegraf';
 
 // ===== ENV =====
-const BOT_TOKEN       = process.env.BOT_TOKEN;
-const ADMIN_ID        = process.env.ADMIN_ID ? Number(process.env.ADMIN_ID) : undefined;
-const PAYMENT_QR_URL  = process.env.PAYMENT_QR_URL || '';         // URL картинки QR для оплаты (3500 ₽)
-const CAL_BOOKING_URL = process.env.CAL_BOOKING_URL || '';        // https://cal.com/yourname/event
-const PRICE_RUB       = 3500;
+const BOT_TOKEN        = process.env.BOT_TOKEN;
+const ADMIN_ID         = process.env.ADMIN_ID ? Number(process.env.ADMIN_ID) : undefined;             // личный ID (человек)
+const ADMIN_CHANNEL    = process.env.ADMIN_CHANNEL ? Number(process.env.ADMIN_CHANNEL) : undefined;   // ID канала/группы (-100…)
+const PAYMENT_QR_URL   = process.env.PAYMENT_QR_URL || '';       // прямая ссылка на PNG/JPG QR оплаты
+const CAL_BOOKING_URL  = process.env.CAL_BOOKING_URL || '';      // https://cal.com/yourname/event
+const PRICE_RUB        = 3500;
 
 if (!BOT_TOKEN) { console.error('❌ Missing BOT_TOKEN'); process.exit(1); }
 
 const bot = new Telegraf(BOT_TOKEN);
+
+// ===== утилита: куда слать админу =====
+function getAdminTargets() {
+  const ids = [];
+  if (Number.isFinite(ADMIN_ID)) ids.push(ADMIN_ID);
+  if (Number.isFinite(ADMIN_CHANNEL)) ids.push(ADMIN_CHANNEL);
+  return ids;
+}
+async function sendToAdmins(telegram, payload, photos = []) {
+  const targets = getAdminTargets();
+  for (const chatId of targets) {
+    try {
+      await telegram.sendMessage(chatId, payload);
+      for (const f of photos) {
+        await telegram.sendPhoto(chatId, f).catch(()=>{});
+      }
+    } catch (e) {
+      console.warn('admin send warn:', e.message);
+    }
+  }
+}
 
 // ===== Юридика (кратко) =====
 const LEGAL_BRIEF =
@@ -174,15 +196,8 @@ const wizard = new WizardScene(
       await ctx.reply('Оплата подтверждена ✅. Напишите удобные дни/время — подберу ближайшее окно.');
     }
 
-    if (ADMIN_ID) {
-      await ctx.telegram.sendMessage(ADMIN_ID, summarize(ctx));
-      const d = ctx.session.ari;
-      if (d.photos?.length) {
-        for (const file_id of d.photos) {
-          await ctx.telegram.sendPhoto(ADMIN_ID, file_id).catch(()=>{});
-        }
-      }
-    }
+    // админ-уведомление
+    await sendToAdmins(ctx.telegram, summarize(ctx), (ctx.session.ari.photos || []));
 
     await ctx.reply('Спасибо! После выбора времени пришлю подтверждение.');
     return ctx.scene.leave();
@@ -202,23 +217,19 @@ bot.start(async (ctx) => {
 
   // Вернулись из Cal.com по Redirect
   if (payload === 'booked') {
-    await ctx.reply('Запись получена ✅\nСпасибо! Я пришлю ссылку на телемост и уточню детали перед консультацией.');
+    await ctx.reply(
+      'Запись получена ✅\nСпасибо! Я пришлю ссылку на телемост и уточню детали перед консультацией.'
+    );
 
-    if (ADMIN_ID) {
-      const d = ctx.session?.ari || {};
-      const card =
-        `📥 Подтверждение через deep-link\n` +
-        `Пациент: @${ctx.from?.username || '—'} (id ${ctx.from?.id})\n` +
-        `Жалобы: ${prettify(d.complaints)}\n` +
-        `Анамнез заболевания: ${prettify(d.hxDisease)}\n` +
-        (d.photos?.length ? `Фото: ${d.photos.length} шт.\n` : '');
-      await ctx.telegram.sendMessage(ADMIN_ID, card).catch(()=>{});
-      if (d.photos?.length) {
-        for (const file_id of d.photos) {
-          await ctx.telegram.sendPhoto(ADMIN_ID, file_id).catch(()=>{});
-        }
-      }
-    }
+    const d = ctx.session?.ari || {};
+    const card =
+      `📥 Подтверждение через deep-link\n` +
+      `Пациент: @${ctx.from?.username || '—'} (id ${ctx.from?.id})\n` +
+      `Жалобы: ${prettify(d.complaints)}\n` +
+      `Анамнез заболевания: ${prettify(d.hxDisease)}\n` +
+      (d.photos?.length ? `Фото: ${d.photos.length} шт.\n` : '');
+
+    await sendToAdmins(ctx.telegram, card, (d.photos || []));
     return; // не запускаем анкету заново
   }
 
@@ -236,20 +247,11 @@ bot.command('id', async (ctx) => {
 bot.action('booked_yes', async (ctx) => {
   await ctx.answerCbQuery('Спасибо!');
   await ctx.reply('Запись отмечена ✅. Я пришлю ссылку на телемост и уточню детали перед консультацией.');
-  if (ADMIN_ID) {
-    try {
-      await ctx.telegram.sendMessage(
-        ADMIN_ID,
-        `Пациент @${ctx.from.username || '—'} (id ${ctx.from.id}) отметил, что бронь выполнена.`
-      );
-      const d = ctx.session?.ari || {};
-      if (d?.photos?.length) {
-        for (const file_id of d.photos) {
-          await ctx.telegram.sendPhoto(ADMIN_ID, file_id).catch(()=>{});
-        }
-      }
-    } catch {}
-  }
+  const d = ctx.session?.ari || {};
+  const note =
+    `📥 Ручное подтверждение брони\n` +
+    `Пациент: @${ctx.from.username || '—'} (id ${ctx.from.id})`;
+  await sendToAdmins(ctx.telegram, note, (d.photos || []));
 });
 
 // ===== Express / health-check =====
@@ -271,5 +273,3 @@ const PORT = process.env.PORT || 3000;
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
-
