@@ -1,26 +1,23 @@
-// index.js — ARI Telegram Bot (QR 3500 ₽ + Cal.com webhook + /id + fallback)
-// Поток: согласие → жалобы → анамнез заболевания → фото → QR → "Я оплатил(а)" → Cal.com (?tgid=...) → webhook подтверждает
-// ENV: BOT_TOKEN, ADMIN_ID, PAYMENT_QR_URL, CAL_BOOKING_URL, PUBLIC_BASE_URL, CAL_WEBHOOK_SECRET (опц.)
+// index.js — ARI Telegram Bot (QR 3500 ₽ + Cal.com redirect + /id + fallback)
+// Поток: согласие → жалобы → анамнез заболевания → фото → QR → "Я оплатил(а)" → Cal.com (?tgid=...) → redirect в бота (/start booked)
+// ENV: BOT_TOKEN, ADMIN_ID, PAYMENT_QR_URL, CAL_BOOKING_URL
 // Требования: Node >= 20, зависимости: telegraf, express
 
 import express from 'express';
-import crypto from 'crypto';
 import { Telegraf, Markup, Scenes, session } from 'telegraf';
 
 // ===== ENV =====
-const BOT_TOKEN          = process.env.BOT_TOKEN;
-const ADMIN_ID           = process.env.ADMIN_ID ? Number(process.env.ADMIN_ID) : undefined;
-const PAYMENT_QR_URL     = process.env.PAYMENT_QR_URL || '';            // URL картинки QR для оплаты
-const CAL_BOOKING_URL    = process.env.CAL_BOOKING_URL || '';           // https://cal.com/yourname/event
-const PUBLIC_BASE_URL    = process.env.PUBLIC_BASE_URL || '';           // https://<bot>.up.railway.app
-const CAL_WEBHOOK_SECRET = process.env.CAL_WEBHOOK_SECRET || '';        // строка для подписи (можно пусто на отладке)
-const PRICE_RUB          = 3500;
+const BOT_TOKEN       = process.env.BOT_TOKEN;
+const ADMIN_ID        = process.env.ADMIN_ID ? Number(process.env.ADMIN_ID) : undefined;
+const PAYMENT_QR_URL  = process.env.PAYMENT_QR_URL || '';         // URL картинки QR для оплаты (3500 ₽)
+const CAL_BOOKING_URL = process.env.CAL_BOOKING_URL || '';        // https://cal.com/yourname/event
+const PRICE_RUB       = 3500;
 
 if (!BOT_TOKEN) { console.error('❌ Missing BOT_TOKEN'); process.exit(1); }
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// ===== Юридический блок =====
+// ===== Юридика (кратко) =====
 const LEGAL_BRIEF =
   '⚖️ Важно:\n' +
   '— Бот не является медицинской консультацией и не ставит диагноз.\n' +
@@ -58,43 +55,6 @@ function summarize(ctx){
   if (d.photos?.length) parts.push(`Фото: ${d.photos.length} шт.`);
   if (d.paid) parts.push('Оплата: подтверждена пользователем');
   return parts.join('\n');
-}
-
-function extractTgIdFromCalPayload(body){
-  const meta = body?.metadata || body?.meta || {};
-  if (meta.tgid && /^\d+$/.test(String(meta.tgid))) return Number(meta.tgid);
-
-  const responses = body?.responses || body?.answers || body?.questionsAndAnswers || [];
-  for (const r of responses) {
-    const label = (r?.label || r?.question || '').toString().toLowerCase();
-    const val   = (r?.value || r?.answer || '').toString().trim();
-    if ((/telegram\s*id/.test(label) || /tgid|telegram_id/.test(label)) && /^\d+$/.test(val)) {
-      return Number(val);
-    }
-  }
-
-  const attendees = body?.attendees || [];
-  for (const a of attendees) {
-    const note = (a?.notes || '').toString();
-    const m = note.match(/tgid[:=]\s*(\d{4,})/i);
-    if (m) return Number(m[1]);
-  }
-
-  const urlParams = body?.urlParameters || body?.urlParams || {};
-  if (urlParams.tgid && /^\d+$/.test(String(urlParams.tgid))) return Number(urlParams.tgid);
-
-  return undefined;
-}
-
-function bookingShortInfo(body){
-  try{
-    const event = body?.eventType?.slug || body?.eventType || 'event';
-    const start = body?.startTime || body?.start?.time || body?.start_time || '';
-    const end   = body?.endTime   || body?.end?.time   || body?.end_time   || '';
-    const name  = body?.name || body?.attendees?.[0]?.name || '';
-    const email = body?.email || body?.attendees?.[0]?.email || '';
-    return `🗓 Бронь: ${event}\nИмя: ${name}\nEmail: ${email}\nВремя: ${start} → ${end}`;
-  } catch { return '🗓 Новая бронь'; }
 }
 
 // ===== Сцены =====
@@ -207,7 +167,7 @@ const wizard = new WizardScene(
         Markup.inlineKeyboard([[ Markup.button.url('📅 Выбрать время', url) ]])
       );
       await ctx.reply(
-        'Когда завершите запись в календаре, вернитесь сюда и нажмите кнопку ниже:',
+        'После брони Cal.com вернёт вас в бота. Если этого не произошло — нажмите:',
         Markup.inlineKeyboard([[Markup.button.callback('Я забронировал(а)', 'booked_yes')]])
       );
     } else {
@@ -235,14 +195,44 @@ bot.use(session());
 bot.use(stage.middleware());
 
 // ===== Команды =====
-bot.start(async (ctx) => { await ctx.scene.enter('ari'); });
+
+// /start с deep-link параметром (например, /start booked)
+bot.start(async (ctx) => {
+  const payload = (ctx.startPayload || '').trim().toLowerCase();
+
+  // Вернулись из Cal.com по Redirect
+  if (payload === 'booked') {
+    await ctx.reply('Запись получена ✅\nСпасибо! Я пришлю ссылку на телемост и уточню детали перед консультацией.');
+
+    if (ADMIN_ID) {
+      const d = ctx.session?.ari || {};
+      const card =
+        `📥 Подтверждение через deep-link\n` +
+        `Пациент: @${ctx.from?.username || '—'} (id ${ctx.from?.id})\n` +
+        `Жалобы: ${prettify(d.complaints)}\n` +
+        `Анамнез заболевания: ${prettify(d.hxDisease)}\n` +
+        (d.photos?.length ? `Фото: ${d.photos.length} шт.\n` : '');
+      await ctx.telegram.sendMessage(ADMIN_ID, card).catch(()=>{});
+      if (d.photos?.length) {
+        for (const file_id of d.photos) {
+          await ctx.telegram.sendPhoto(ADMIN_ID, file_id).catch(()=>{});
+        }
+      }
+    }
+    return; // не запускаем анкету заново
+  }
+
+  // Обычный запуск анкеты
+  await ctx.scene.enter('ari');
+});
+
 bot.command('terms', async (ctx) => ctx.reply(TERMS_TEXT));
 bot.command('privacy', async (ctx) => ctx.reply(PRIVACY_TEXT));
 bot.command('id', async (ctx) => {
   await ctx.reply(`Ваш Telegram ID: \`${ctx.from.id}\``, { parse_mode: 'Markdown' });
 });
 
-// Fallback на случай, если вебхук Cal.com не дошёл
+// Fallback: «Я забронировал(а)»
 bot.action('booked_yes', async (ctx) => {
   await ctx.answerCbQuery('Спасибо!');
   await ctx.reply('Запись отмечена ✅. Я пришлю ссылку на телемост и уточню детали перед консультацией.');
@@ -266,73 +256,6 @@ bot.action('booked_yes', async (ctx) => {
 const app = express();
 app.get('/', (_req, res) => res.send('ARI bot is running'));
 
-// Пинг-страница для Cal.com
-app.get('/cal/webhook', (_req, res) => res.status(200).send('Cal webhook endpoint is alive'));
-
-// Основной вебхук Cal.com — принимаем ЛЮБОЙ content-type, отвечаем мгновенно
-app.post('/cal/webhook', express.raw({ type: () => true, limit: '2mb' }), async (req, res) => {
-  try {
-    const buf = req.body || Buffer.from('{}');
-    const textBody = Buffer.isBuffer(buf) ? buf.toString('utf8') : String(buf || '{}');
-
-    // Если Cal.com шлёт пустой ping — просто 200
-    if (!textBody || textBody.trim() === '') return res.status(200).send('OK');
-
-    // Проверка подписи (можно оставить пустым CAL_WEBHOOK_SECRET на отладке)
-    if (CAL_WEBHOOK_SECRET) {
-      const sigHeader =
-        req.header('x-cal-signature') ||
-        req.header('x-cal-signature-256') ||
-        req.header('x-webhook-signature') ||
-        req.header('cal-signature') || '';
-      const expected = crypto.createHmac('sha256', CAL_WEBHOOK_SECRET).update(textBody).digest('hex');
-      const presented = sigHeader.replace(/^sha256=/,'').trim();
-      if (!presented || presented !== expected) {
-        console.warn('⚠️ Cal webhook bad signature');
-        return res.status(400).send('bad signature');
-      }
-    } else {
-      console.warn('⚠️ CAL_WEBHOOK_SECRET empty — signature check disabled (debug)');
-    }
-
-    let data; try { data = JSON.parse(textBody); } catch { data = {}; }
-
-    // Сразу отвечаем 200, чтобы не было 502 из-за таймаута
-    res.status(200).send('OK');
-
-    const event = (data?.triggerEvent || data?.event || '').toString().toUpperCase();
-    if (!event || !/BOOKING|SCHEDULED|CREATED|CONFIRMED/.test(event)) return;
-
-    let tgId = extractTgIdFromCalPayload(data);
-    // Доп. попытка: часто кладут id в questionsAndAnswers
-    if (!tgId) {
-      const q = data?.questionsAndAnswers || [];
-      for (const qa of q) {
-        const lbl = String(qa?.question || qa?.label || '').toLowerCase();
-        const val = String(qa?.answer || qa?.value || '').trim();
-        if ((/telegram\s*id|tgid|telegram_id/.test(lbl)) && /^\d+$/.test(val)) { tgId = Number(val); break; }
-      }
-    }
-
-    const short = bookingShortInfo(data);
-
-    if (ADMIN_ID) {
-      await bot.telegram.sendMessage(ADMIN_ID, `📥 Cal.com webhook\n${short}\nTGID: ${tgId || 'не найден'}`).catch(()=>{});
-    }
-
-    if (tgId) {
-      await bot.telegram.sendMessage(
-        tgId,
-        'Запись получена ✅\nСпасибо! Я пришлю ссылку на телемост и уточню детали перед консультацией.'
-      ).catch((e)=>console.error('send to patient failed:', e.message));
-    }
-  } catch (e) {
-    console.error('Cal webhook error:', e);
-    if (!res.headersSent) res.status(500).send('error');
-  }
-});
-
-// ===== Запуск =====
 const PORT = process.env.PORT || 3000;
 (async () => {
   try {
@@ -348,4 +271,5 @@ const PORT = process.env.PORT || 3000;
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
 
